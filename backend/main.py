@@ -28,7 +28,9 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 # Shared state
 active_clients: set[WebSocket] = set()
 stream_task: Optional[asyncio.Task] = None
+monitor_task: Optional[asyncio.Task] = None
 current_token_ids: list[str] = []
+current_slug: Optional[str] = None
 
 
 def get_token_ids(slug: str) -> tuple[list[str], dict]:
@@ -42,6 +44,10 @@ def get_token_ids(slug: str) -> tuple[list[str], dict]:
     except Exception as e:
         logger.error(f"Error fetching market {slug}: {e}")
         return [], {}
+
+
+def is_5m_slug(slug: str) -> bool:
+    return slug.startswith("btc-updown-5m-")
 
 
 async def broadcast(message: str):
@@ -73,6 +79,58 @@ async def run_polymarket_stream(token_ids: list[str]):
     except Exception as e:
         logger.error(f"Stream error: {e}")
         await broadcast(json.dumps({"event_type": "error", "message": str(e)}))
+
+
+async def monitor_5m_market():
+    """Sleep until the next 5-minute boundary, then auto-switch to the new market."""
+    global stream_task, current_token_ids, current_slug
+
+    while active_clients:
+        # Derive the next boundary from the tracked slug's timestamp, not time.time().
+        # This ensures the next slug is always exactly +300s from the one we're on.
+        try:
+            slug_time = int(current_slug.split("-")[-1])  # type: ignore[union-attr]
+            next_boundary = slug_time + 300
+        except (ValueError, AttributeError, TypeError):
+            next_boundary = ((int(time.time()) // 300) + 1) * 300
+
+        sleep_for = max(next_boundary - time.time() + 3, 1)
+        logger.info(f"5m monitor: sleeping {sleep_for:.1f}s until {next_boundary}")
+        await asyncio.sleep(sleep_for)
+
+        new_slug = f"btc-updown-5m-{next_boundary}"
+
+        # Retry fetching token IDs — new market can take up to ~60s to appear
+        token_ids: list[str] = []
+        for attempt in range(12):
+            token_ids, _ = get_token_ids(new_slug)
+            if token_ids:
+                break
+            logger.info(f"Waiting for {new_slug} (attempt {attempt + 1}/12)...")
+            await asyncio.sleep(10)
+
+        if not token_ids:
+            logger.warning(f"Could not find new 5m market after retries: {new_slug}")
+            continue
+
+        logger.info(f"Auto-switching stream to {new_slug}")
+
+        if stream_task and not stream_task.done():
+            stream_task.cancel()
+            await asyncio.sleep(0.1)
+
+        current_token_ids = token_ids
+        current_slug = new_slug
+
+        # Broadcast market_changed BEFORE starting the new stream so the frontend
+        # resets its state before any book events from the new market arrive.
+        await broadcast(json.dumps({
+            "event_type": "market_changed",
+            "slug": new_slug,
+            "token_ids": token_ids,
+        }))
+
+        stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
 
 
 @app.get("/api/market/{slug}")
@@ -109,7 +167,7 @@ def get_active_markets():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global stream_task, current_token_ids
+    global stream_task, monitor_task, current_token_ids, current_slug
     await websocket.accept()
     active_clients.add(websocket)
     logger.info(f"Client connected. Total: {len(active_clients)}")
@@ -138,10 +196,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         stream_task.cancel()
                         await asyncio.sleep(0.1)
                     current_token_ids = token_ids
+                    current_slug = slug
                     stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
 
                 elif not stream_task or stream_task.done():
                     stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
+
+                # Start the 5m monitor if subscribing to a 5m market and not already running
+                if is_5m_slug(slug) and (not monitor_task or monitor_task.done()):
+                    monitor_task = asyncio.create_task(monitor_5m_market())
 
                 await websocket.send_text(json.dumps({
                     "event_type": "subscribed",
@@ -152,6 +215,10 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         active_clients.discard(websocket)
         logger.info(f"Client disconnected. Total: {len(active_clients)}")
-        if not active_clients and stream_task and not stream_task.done():
-            stream_task.cancel()
+        if not active_clients:
+            if stream_task and not stream_task.done():
+                stream_task.cancel()
+            if monitor_task and not monitor_task.done():
+                monitor_task.cancel()
             current_token_ids = []
+            current_slug = None

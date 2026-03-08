@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { MarketState, OrderBook, PricePoint, MarketEvent, OrderBookEntry } from '../types'
+import type { MarketState, OrderBook, PricePoint, OrderBookEntry } from '../types'
 
 const WS_URL = 'ws://localhost:8000/ws'
 const MAX_PRICE_HISTORY = 300
-const MAX_EVENTS = 100
 
 function getMidPrice(books: Record<string, OrderBook>): PricePoint | null {
   const book = Object.values(books)[0]
@@ -28,13 +27,12 @@ export function useMarketStream(slug: string | null) {
   const [state, setState] = useState<MarketState>({
     orderBooks: {},
     priceHistory: [],
-    events: [],
     status: 'disconnected',
+    currentSlug: null,
+    yesTokenId: null,
   })
 
   const wsRef = useRef<WebSocket | null>(null)
-  const eventIdRef = useRef(0)
-  // Keep a ref to current order books so onmessage handler stays current
   const booksRef = useRef<Record<string, OrderBook>>({})
 
   const connect = useCallback((targetSlug: string) => {
@@ -44,8 +42,9 @@ export function useMarketStream(slug: string | null) {
     setState({
       orderBooks: {},
       priceHistory: [],
-      events: [],
+      yesTokenId: null,
       status: 'connecting',
+      currentSlug: null,
     })
 
     const ws = new WebSocket(WS_URL)
@@ -62,20 +61,29 @@ export function useMarketStream(slug: string | null) {
 
       setState(prev => {
         const newBooks = { ...booksRef.current }
-        const newEvents: MarketEvent[] = [...prev.events]
         let priceUpdated = false
 
         for (const msg of messages) {
           const eventType = msg.event_type as string ?? 'unknown'
           const assetId = msg.asset_id as string | undefined
 
-          newEvents.unshift({
-            id: ++eventIdRef.current,
-            event_type: eventType,
-            asset_id: assetId,
-            raw: msg,
-            timestamp: Date.now(),
-          })
+          if (eventType === 'subscribed') {
+            const tokenIds = msg.token_ids as string[]
+            return { ...prev, currentSlug: msg.slug as string, yesTokenId: tokenIds?.[0] ?? null }
+          }
+
+          if (eventType === 'market_changed') {
+            // New 5m market opened — reset order book and price history
+            booksRef.current = {}
+            const tokenIds = msg.token_ids as string[]
+            return {
+              ...prev,
+              orderBooks: {},
+              priceHistory: [],
+              currentSlug: msg.slug as string,
+              yesTokenId: tokenIds?.[0] ?? null,
+            }
+          }
 
           if (eventType === 'book' && assetId) {
             newBooks[assetId] = {
@@ -127,7 +135,6 @@ export function useMarketStream(slug: string | null) {
           ...prev,
           orderBooks: newBooks,
           priceHistory: newPriceHistory,
-          events: newEvents.slice(0, MAX_EVENTS),
         }
       })
     }

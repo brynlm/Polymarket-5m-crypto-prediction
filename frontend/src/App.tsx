@@ -26,16 +26,29 @@ export default function App() {
   const market = useMarketStream(selectedSlug)
 
   useEffect(() => {
-    fetch(`${API_URL}/api/markets/active`)
-      .then(r => r.json())
-      .then((data: ActiveMarket[]) => {
-        setActiveMarkets(data)
-        if (data.length > 0 && !selectedSlug) {
-          setSelectedSlug(data[0].slug)
+    let cancelled = false
+
+    async function fetchWithRetry() {
+      // Retry up to 10 times with 1s delay — backend may still be starting up
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          const r = await fetch(`${API_URL}/api/markets/active`)
+          const data: ActiveMarket[] = await r.json()
+          if (cancelled) return
+          if (data.length > 0) {
+            setActiveMarkets(data)
+            setSelectedSlug(data[0].slug)
+            return
+          }
+        } catch {
+          // backend not ready yet
         }
-      })
-      .catch(console.error)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+        await new Promise(r => setTimeout(r, 1000))
+      }
+    }
+
+    fetchWithRetry()
+    return () => { cancelled = true }
   }, [])
 
   function handleCustomSlug() {
@@ -57,7 +70,7 @@ export default function App() {
       <div className="flex items-start justify-between mb-5">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-white">Polymarket Dashboard</h1>
-          <p className="text-xs text-gray-500 mt-0.5">{selectedSlug ?? 'No market selected'}</p>
+          <p className="text-xs text-gray-500 mt-0.5">{market.currentSlug ?? selectedSlug ?? 'No market selected'}</p>
         </div>
         <div className="flex items-center gap-2 mt-1">
           <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
@@ -132,7 +145,7 @@ export default function App() {
 
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
           <h2 className="text-sm font-medium text-gray-300 mb-3">Order Book</h2>
-          <OrderBook books={market.orderBooks} />
+          <OrderBook books={market.orderBooks} yesTokenId={market.yesTokenId} />
         </div>
 
       </div>

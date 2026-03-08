@@ -17,18 +17,11 @@ export interface PricePoint {
   bestAsk: number
 }
 
-export interface MarketEvent {
-  id: number
-  event_type: string
-  asset_id?: string
-  raw: unknown
-  timestamp: number
-}
-
 export interface MarketState {
   orderBooks: Record<string, OrderBook>
   priceHistory: PricePoint[]
-  events: MarketEvent[]
   status: 'disconnected' | 'connecting' | 'connected' | 'error'
+  currentSlug: string | null
+  yesTokenId: string | null
   error?: string
 }

@@ -2,6 +2,7 @@ import type { OrderBook, OrderBookEntry } from '../types'
 
 interface Props {
   books: Record<string, OrderBook>
+  yesTokenId?: string | null
   tokenLabels?: Record<string, string>
 }
 
@@ -23,19 +24,20 @@ function DepthRow({ entry, maxSize, side }: { entry: OrderBookEntry; maxSize: nu
   )
 }
 
-export function OrderBook({ books, tokenLabels = {} }: Props) {
-  const bookEntries = Object.entries(books)
+export function OrderBook({ books, yesTokenId, tokenLabels = {} }: Props) {
+  // Only show the YES token. If yesTokenId is known but the book hasn't arrived yet
+  // (e.g. NO event arrived first after a market switch), wait rather than show wrong data.
+  const book = yesTokenId ? books[yesTokenId] : Object.values(books)[0]
+  const assetId = yesTokenId ?? Object.keys(books)[0] ?? ''
+  const label = tokenLabels[assetId] ?? 'YES token'
 
-  if (bookEntries.length === 0) {
+  if (!book) {
     return (
       <div className="flex items-center justify-center h-32 text-gray-500 text-sm">
         Waiting for order book...
       </div>
     )
   }
-
-  const [assetId, book] = bookEntries[0]
-  const label = tokenLabels[assetId] ?? 'YES token'
   const topBids = book.bids.slice(0, 8)
   const topAsks = book.asks.slice(0, 8)
   const maxBidSize = Math.max(...topBids.map(e => e.size), 1)
