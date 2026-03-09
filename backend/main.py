@@ -67,7 +67,7 @@ async def run_polymarket_stream(token_ids: list[str]):
             sub_msg = {
                 "action": "subscribe",
                 "type": "market",
-                "assets_ids": token_ids,
+                "assets_ids": [token_ids[0]],  # Subscribe to only YES token market data for simplicity (hot fix, needs to be refactored later on)
                 "custom_feature_enabled": True,
             }
             await ws.send(json.dumps(sub_msg))
