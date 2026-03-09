@@ -4,6 +4,7 @@ import websockets
 import requests
 import time
 import pandas as pd
+import numpy as np
 import os
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -25,12 +26,13 @@ def get_token_ids_by_slug(slug):
 def format_book_data_to_dataframe(data):
     bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype=float).sort_values('price', ascending=False)
     bids_snapshot['timestamp'] = int(data['timestamp'])
-    bids_snapshot['market_id'] = data['market']
     bids_snapshot['order_type'] = 'bid'
-    asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'], dtype=float)
+    asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'])
     asks_snapshot['timestamp'] = int(data['timestamp'])
-    asks_snapshot['market_id'] = data['market']
     asks_snapshot['order_type'] = 'ask'
+    df = pd.concat([bids_snapshot, asks_snapshot])
+    df['price'] = df['price'].astype('float16')
+    df['size'] = df['size'].astype('float16')
     return pd.concat([bids_snapshot, asks_snapshot])
 
 def save_book_market_data(books, slug):
@@ -87,7 +89,7 @@ async def stream_market_data(token_ids):
                     end_of_curr_interval += 300
                     token_ids = new_token_ids
                     save_book_market_data(book_snapshots, f"btc-updown-5m-{end_of_curr_interval-300}")
-                    book_snapshots.clear()
+                    book_snapshots.clear() # Clear old snapshots for old market
 
         except asyncio.CancelledError:
             print("Stream cancelled")
@@ -113,11 +115,11 @@ async def main():
         print("Keyboard interrupt received")
         task.cancel()
         await task
-    finally:
-        # Save book snapshots on close
-        global book_snapshots
-        df_new_data = pd.concat(book_snapshots)
-        df_new_data.to_pickle(f"raw_book_data/book-{slug}.pkl")
+    # finally:
+        # # Save book snapshots on close
+        # global book_snapshots
+        # df_new_data = pd.concat(book_snapshots)
+        # df_new_data.to_pickle(f"raw_book_data/book-{slug}.pkl")
 
 
 if __name__ == "__main__":
