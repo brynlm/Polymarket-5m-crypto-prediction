@@ -24,15 +24,14 @@ def get_token_ids_by_slug(slug):
 # -----------------------------
 
 def format_book_data_to_dataframe(data):
-    bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype=float).sort_values('price', ascending=False)
-    bids_snapshot['timestamp'] = int(data['timestamp']) // 1000
+    bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype='float32').sort_values('price', ascending=False)
+    bids_snapshot['timestamp'] = int(data['timestamp'])
     bids_snapshot['order_type'] = 'bid'
     asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'])
-    asks_snapshot['timestamp'] = int(data['timestamp']) // 1000
+    asks_snapshot['timestamp'] = int(data['timestamp'])
     asks_snapshot['order_type'] = 'ask'
-    df = pd.concat([bids_snapshot, asks_snapshot])
-    df['price'] = df['price'].astype('float16')
-    df['size'] = df['size'].astype('float16')
+    # df['price'] = df['price'].astype('float16')
+    # df['size'] = df['size'].astype('float16')
     return pd.concat([bids_snapshot, asks_snapshot])
 
 def save_book_market_data(books, slug):
@@ -62,7 +61,7 @@ async def stream_market_data(token_ids):
                 msg = await ws.recv()
                 data = json.loads(msg)
                 data = data[0] if isinstance(data, list) else data
-                print(f"{data['market']}: {data['event_type']}")
+                print(f"{data['timestamp']}: {data['event_type']} ")
                 if data['event_type'] == 'book':
                     curr_snapshot = format_book_data_to_dataframe(data)
                     book_snapshots.append(curr_snapshot.copy())
@@ -71,14 +70,15 @@ async def stream_market_data(token_ids):
                     for prx_change in data['price_changes']:
                         order_type = 'bid' if prx_change['side'] == 'BUY' else 'ask'
                         if float(prx_change['size']) == 0:
-                            # remove price level from snapshot
+                            # Remove price level from snapshot
                             idx_arr = (curr_snapshot['price'] != float(prx_change['price'])) & (curr_snapshot['order_type'] == order_type)
                             curr_snapshot = curr_snapshot.loc[idx_arr]
                         else:
-                            # update price level
+                            # Update price level
                             idx_arr = (curr_snapshot['price'] == float(prx_change['price'])) & (curr_snapshot['order_type'] == order_type)
                             curr_snapshot.loc[idx_arr, 'size'] = float(prx_change['size'])
-                            book_snapshots.append(curr_snapshot.copy())
+                    curr_snapshot['timestamp'] = int(data['timestamp'])
+                    book_snapshots.append(curr_snapshot.copy())
 
                 curr_time = int(data['timestamp']) // 1000
                 if curr_time >= end_of_curr_interval:
