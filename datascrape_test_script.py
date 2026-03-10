@@ -25,10 +25,10 @@ def get_token_ids_by_slug(slug):
 
 def format_book_data_to_dataframe(data):
     bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype=float).sort_values('price', ascending=False)
-    bids_snapshot['timestamp'] = int(data['timestamp'])
+    bids_snapshot['timestamp'] = int(data['timestamp']) // 1000
     bids_snapshot['order_type'] = 'bid'
     asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'])
-    asks_snapshot['timestamp'] = int(data['timestamp'])
+    asks_snapshot['timestamp'] = int(data['timestamp']) // 1000
     asks_snapshot['order_type'] = 'ask'
     df = pd.concat([bids_snapshot, asks_snapshot])
     df['price'] = df['price'].astype('float16')
@@ -65,6 +65,7 @@ async def stream_market_data(token_ids):
                 print(f"{data['market']}: {data['event_type']}")
                 if data['event_type'] == 'book':
                     curr_snapshot = format_book_data_to_dataframe(data)
+                    book_snapshots.append(curr_snapshot.copy())
 
                 elif data['event_type'] == 'price_change':
                     for prx_change in data['price_changes']:
@@ -74,9 +75,10 @@ async def stream_market_data(token_ids):
                             idx_arr = (curr_snapshot['price'] != float(prx_change['price'])) & (curr_snapshot['order_type'] == order_type)
                             curr_snapshot = curr_snapshot.loc[idx_arr]
                         else:
+                            # update price level
                             idx_arr = (curr_snapshot['price'] == float(prx_change['price'])) & (curr_snapshot['order_type'] == order_type)
                             curr_snapshot.loc[idx_arr, 'size'] = float(prx_change['size'])
-                book_snapshots.append(curr_snapshot.copy())
+                            book_snapshots.append(curr_snapshot.copy())
 
                 curr_time = int(data['timestamp']) // 1000
                 if curr_time >= end_of_curr_interval:
