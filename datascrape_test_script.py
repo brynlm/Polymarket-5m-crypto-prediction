@@ -24,10 +24,10 @@ def get_token_ids_by_slug(slug):
 # -----------------------------
 
 def format_book_data_to_dataframe(data):
-    bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype='float32').sort_values('price', ascending=False)
+    bids_snapshot = pd.DataFrame(data['bids'], columns=['price', 'size'], dtype='float64').sort_values('price', ascending=False)
     bids_snapshot['timestamp'] = int(data['timestamp'])
     bids_snapshot['order_type'] = 'bid'
-    asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'])
+    asks_snapshot = pd.DataFrame(data['asks'], columns=['price', 'size'], dtype='float64')
     asks_snapshot['timestamp'] = int(data['timestamp'])
     asks_snapshot['order_type'] = 'ask'
     # df['price'] = df['price'].astype('float16')
@@ -84,7 +84,7 @@ async def stream_market_data(token_ids):
                                 curr_snapshot.loc[idx_arr, 'size'] = size
                             else:
                                 # Add new price level
-                                new_row = pd.DataFrame({'price': [price], 'size': [size], 'timestamp': [int(data['timestamp'])], 'order_type': [order_type]})
+                                new_row = pd.DataFrame({'price': pd.array([price], dtype='float64'), 'size': pd.array([size], dtype='float64'), 'timestamp': [ts], 'order_type': [order_type]})
                                 curr_snapshot = pd.concat([curr_snapshot, new_row], ignore_index=True)
                     # ts = int(data['timestamp'])
                 curr_snapshot['timestamp'] = ts
