@@ -90,9 +90,13 @@ def extract_features(df: pd.DataFrame, n_levels: int = 5) -> pd.DataFrame:
     )
     ask_piv.columns = [f'ask_size_L{i+1}' for i in range(n_levels)]
 
+    # BTC spot price per timestamp (consistent within a snapshot, take last)
+    btc_price = df.groupby('timestamp')['btc_price'].last().rename('btc_price') \
+        if 'btc_price' in df.columns else pd.Series(dtype='float64', name='btc_price')
+
     feat = pd.concat(
         [best_bid, best_ask, bid_vol, ask_vol, bid_vol_all, ask_vol_all,
-         bid_n_lvl, ask_n_lvl, bid_piv, ask_piv],
+         bid_n_lvl, ask_n_lvl, bid_piv, ask_piv, btc_price],
         axis=1
     ).sort_index()
 
@@ -147,10 +151,14 @@ def add_interval_features(feat: pd.DataFrame, file_ts_s: int) -> pd.DataFrame:
     # Time of day in seconds since midnight  [0, 86400)
     feat['time_of_day_s'] = (feat.index // 1000) % 86400
 
-    # Prediction-market target: earliest midprice in this file
-    target_price = feat['mid'].iloc[0]
-    feat['dist_from_target'] = feat['mid'] - target_price
-    feat['above_target']     = (feat['mid'] > target_price).astype(float)
+    # BTC price change from the opening (earliest) BTC price in this interval
+    if 'btc_price' in feat.columns:
+        feat['btc_price_from_open'] = feat['btc_price'] - feat['btc_price'].iloc[0]
+
+    # # Prediction-market target: earliest midprice in this file
+    # target_price = feat['mid'].iloc[0]
+    # feat['dist_from_target'] = feat['mid'] - target_price
+    # feat['above_target']     = (feat['mid'] > target_price).astype(float)
 
     return feat
 
@@ -161,7 +169,8 @@ def add_interval_features(feat: pd.DataFrame, file_ts_s: int) -> pd.DataFrame:
 
 # Columns to lag
 _LAG_COLS    = ['mid', 'spread', 'rel_spread', 'imbalance', 'imbalance_all',
-                'microprice', 'micro_minus_mid', 'bid_vol', 'ask_vol']
+                'microprice', 'micro_minus_mid', 'bid_vol', 'ask_vol',
+                'btc_price', 'btc_price_from_open']
 _LAGS        = [1, 2, 5, 10, 20]
 _DIFF_COLS   = ['mid', 'spread', 'imbalance']
 _ROLL_COLS   = ['mid', 'imbalance', 'spread']
@@ -170,6 +179,8 @@ _ROLL_WINS   = [5, 10, 20]
 
 def add_time_features(feat: pd.DataFrame) -> pd.DataFrame:
     for col in _LAG_COLS:
+        if col not in feat.columns:
+            continue
         for lag in _LAGS:
             feat[f'{col}_lag{lag}'] = feat[col].shift(lag)
 
