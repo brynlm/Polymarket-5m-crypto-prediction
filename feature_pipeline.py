@@ -134,16 +134,18 @@ def extract_features(df: pd.DataFrame, n_levels: int = 5) -> pd.DataFrame:
 # 3. Downsampling + interval/temporal features
 # ──────────────────────────────────────────────────────────────
 
-def filter_to_last_per_second(feat: pd.DataFrame, interval_ms: int = 1000) -> pd.DataFrame:
+def filter_to_last_per_second(feat: pd.DataFrame, interval_ms: int = 1000, mean=False) -> pd.DataFrame:
     """Keep only the last snapshot within each time interval.
     Index remains in milliseconds, floored to the interval boundary.
 
     Parameters
     ----------
     interval_ms : interval width in milliseconds (default 1000 = 1 second)
+    mean : If True, the mean is used to downsample points in the same interval instead of the last element. 
+    The default behaviour is False.
     """
     bins = feat.index // interval_ms
-    result = feat.groupby(bins).last()
+    result = feat.groupby(bins).last() if not mean else feat.groupby(bins).mean()
     result.index = result.index * interval_ms  # restore ms scale
     return result
 
@@ -169,11 +171,6 @@ def add_interval_features(feat: pd.DataFrame, file_ts_s: int) -> pd.DataFrame:
     # BTC price change from the opening (earliest) BTC price in this interval
     if 'btc_price' in feat.columns:
         feat['btc_price_from_open'] = feat['btc_price'] - feat['btc_price'].iloc[0]
-
-    # # Prediction-market target: earliest midprice in this file
-    # target_price = feat['mid'].iloc[0]
-    # feat['dist_from_target'] = feat['mid'] - target_price
-    # feat['above_target']     = (feat['mid'] > target_price).astype(float)
 
     return feat
 
@@ -360,7 +357,7 @@ def train_and_evaluate(
 
     if not _supports_multioutput(model):
         model = MultiOutputRegressor(model, n_jobs=-1)
-
+    # TODO: Add Column Transformer to exclude time_of_day from midnight feature from MinMaxScaling
     pipeline = Pipeline([('scaler', MinMaxScaler()), ('model', model)])
     tscv     = TimeSeriesSplit(n_splits=n_splits)
 
@@ -387,11 +384,11 @@ def train_and_evaluate(
     # Refit on full dataset
     pipeline.fit(X, Y)
 
-    # Feature importances (if the model exposes them)
-    imp = _get_feature_importances(pipeline.named_steps['model'], feat_cols)
-    if imp is not None:
-        print(f'\n--- Top 20 feature importances (mean across outputs) ---')
-        print(imp.sort_values(ascending=False).head(20).to_string())
+    # # Feature importances (if the model exposes them)
+    # imp = _get_feature_importances(pipeline.named_steps['model'], feat_cols)
+    # if imp is not None:
+    #     print(f'\n--- Top 20 feature importances (mean across outputs) ---')
+    #     print(imp.sort_values(ascending=False).head(20).to_string())
 
     return pipeline, feat_cols, target_cols
 
@@ -499,6 +496,7 @@ def build_pipeline(
     n_levels: int = 5,
     horizon_ms: int = 5000,
     downsample_ms: int = 1000,
+    mean=False
 ) -> pd.DataFrame:
     """
     Run the full feature extraction pipeline.
@@ -529,7 +527,7 @@ def build_pipeline(
         file_ts_s = _file_ts_from_path(p)
 
         feat = extract_features(df, n_levels=n_levels)
-        feat = filter_to_last_per_second(feat, interval_ms=downsample_ms)
+        feat = filter_to_last_per_second(feat, interval_ms=downsample_ms, mean=mean)
         feat = add_interval_features(feat, file_ts_s)
         per_file_feats.append(feat)
         print(f'  {os.path.basename(p)}: {len(feat)} rows after {downsample_ms}ms filter')
@@ -547,6 +545,7 @@ def build_pipeline(
 
 
 if __name__ == '__main__':
+    MODEL_NAME = 'model_mean_downsample'
     DATA_DIR    = 'raw_book_data'
     N_LEVELS    = 5
     HORIZON_MS  = 5000
@@ -556,17 +555,18 @@ if __name__ == '__main__':
     model = RandomForestRegressor(n_estimators=100, criterion='squared_error', random_state=42)
     # model = None
     feat = build_pipeline(data_dir=DATA_DIR, n_levels=N_LEVELS,
-                          horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE)
+                          horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE, 
+                          mean=True)
     pipeline, feat_cols, target_cols = train_and_evaluate(feat, n_splits=5, model=model)
     print(feat_cols)
 
-    joblib.dump(pipeline, 'model.joblib')
-    print('Model saved to model.joblib')
+    joblib.dump(pipeline, f'{MODEL_NAME}.joblib')
+    print(f'Model saved to {MODEL_NAME}.joblib')
 
     import json as _json
-    with open('model_meta.json', 'w') as _f:
+    with open(f'{MODEL_NAME}_meta.json', 'w') as _f:
         _json.dump({'feat_cols': feat_cols, 'target_cols': target_cols}, _f)
-    print('Metadata saved to model_meta.json')
+    print(f'Metadata saved to {MODEL_NAME}_meta.json')
 
     sample_pkl = sorted(glob.glob(os.path.join(DATA_DIR, 'book-*.pkl')))[0]
     plot_predictions(
