@@ -99,9 +99,14 @@ def extract_features(df: pd.DataFrame, n_levels: int = 5) -> pd.DataFrame:
     btc_price = df.groupby('timestamp')['btc_price'].last().rename('btc_price') \
         if 'btc_price' in df.columns else pd.Series(dtype='float64', name='btc_price')
 
+    # Volume-weighted average price (VWAP) across all visible bid + ask levels
+    bid_pxs = (bids['price'] * bids['size']).groupby(bids['timestamp']).sum()
+    ask_pxs = (asks['price'] * asks['size']).groupby(asks['timestamp']).sum()
+    vwap = ((bid_pxs + ask_pxs) / (bid_vol_all + ask_vol_all + 1e-9)).rename('vwap')
+
     feat = pd.concat(
         [best_bid, best_ask, bid_vol, ask_vol, bid_vol_all, ask_vol_all,
-         bid_n_lvl, ask_n_lvl, bid_piv, ask_piv, btc_price],
+         bid_n_lvl, ask_n_lvl, bid_piv, ask_piv, btc_price, vwap],
         axis=1
     ).sort_index()
 
@@ -180,7 +185,7 @@ def add_interval_features(feat: pd.DataFrame, file_ts_s: int) -> pd.DataFrame:
 # Columns to lag
 _LAG_COLS    = ['mid', 'spread', 'rel_spread', 'imbalance', 'imbalance_all',
                 'microprice', 'micro_minus_mid', 'bid_vol', 'ask_vol',
-                'btc_price', 'btc_price_from_open']
+                'btc_price', 'btc_price_from_open', 'vwap', 'ofi']
 _LAGS        = list(range(10)) #[1, 2, 5, 10, 20]
 _DIFF_COLS   = ['mid', 'spread', 'imbalance']
 _ROLL_COLS   = ['mid', 'imbalance', 'spread']
@@ -190,11 +195,16 @@ _ROLL_WINS   = [5, 10, 20]
 def add_time_features(feat: pd.DataFrame) -> pd.DataFrame:
     new_cols: dict[str, pd.Series] = {}
 
+    # Order flow imbalance: signed change in net top-N bid pressure per interval
+    new_cols['ofi'] = feat['bid_vol'].diff(1) - feat['ask_vol'].diff(1)
+
     for col in _LAG_COLS:
-        if col not in feat.columns:
+        # Source may be an already-existing column or one just computed above
+        src = feat[col] if col in feat.columns else new_cols.get(col)
+        if src is None:
             continue
         for lag in _LAGS:
-            new_cols[f'{col}_lag{lag}'] = feat[col].shift(lag)
+            new_cols[f'{col}_lag{lag}'] = src.shift(lag)
 
     for col in _DIFF_COLS:
         new_cols[f'{col}_diff1'] = feat[col].diff(1)
@@ -543,8 +553,8 @@ if __name__ == '__main__':
     DOWNSAMPLE  = 1000
 
     # model = sklearn.svm.SVR()
-    # model = RandomForestRegressor(n_estimators=300, criterion='squared_error', random_state=42)
-    model = None
+    model = RandomForestRegressor(n_estimators=100, criterion='squared_error', random_state=42)
+    # model = None
     feat = build_pipeline(data_dir=DATA_DIR, n_levels=N_LEVELS,
                           horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE)
     pipeline, feat_cols, target_cols = train_and_evaluate(feat, n_splits=5, model=model)
@@ -552,6 +562,11 @@ if __name__ == '__main__':
 
     joblib.dump(pipeline, 'model.joblib')
     print('Model saved to model.joblib')
+
+    import json as _json
+    with open('model_meta.json', 'w') as _f:
+        _json.dump({'feat_cols': feat_cols, 'target_cols': target_cols}, _f)
+    print('Metadata saved to model_meta.json')
 
     sample_pkl = sorted(glob.glob(os.path.join(DATA_DIR, 'book-*.pkl')))[0]
     plot_predictions(

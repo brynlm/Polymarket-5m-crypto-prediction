@@ -1,18 +1,35 @@
 import asyncio
 import json
+import os
+import sys
 import time
 import logging
 from typing import Optional
 
-import websockets
+import joblib
+import numpy as np
+import pandas as pd
 import requests
+import websockets
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+# Allow imports from project root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from feature_pipeline import add_time_features
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Polymarket Dashboard API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _load_model()
+    asyncio.create_task(poll_btc_price())
+    yield
+
+
+app = FastAPI(title="Polymarket Dashboard API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,27 +41,179 @@ app.add_middleware(
 
 POLYMARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_API = "https://gamma-api.polymarket.com"
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Shared state
+# ──────────────────────────────────────────────────────────────
+# Model
+# ──────────────────────────────────────────────────────────────
+
+_N_LEVELS   = 5
+_MIN_BUFFER = 30   # max_lag(9) + max_roll(20) + 1
+
+_pipeline: Optional[object] = None
+_feat_cols: list[str] = []
+_target_cols: list[str] = []
+
+
+def _load_model() -> None:
+    global _pipeline, _feat_cols, _target_cols
+    model_path = os.path.join(_PROJ_ROOT, 'model.joblib')
+    meta_path  = os.path.join(_PROJ_ROOT, 'model_meta.json')
+    if not os.path.exists(model_path):
+        logger.warning("model.joblib not found — predictions disabled")
+        return
+    if not os.path.exists(meta_path):
+        logger.warning("model_meta.json not found — predictions disabled")
+        return
+    _pipeline = joblib.load(model_path)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    _feat_cols   = meta['feat_cols']
+    _target_cols = meta['target_cols']
+    logger.info(f"Model loaded: {len(_feat_cols)} features → {len(_target_cols)} targets")
+
+
+# ──────────────────────────────────────────────────────────────
+# Live state
+# ──────────────────────────────────────────────────────────────
+
+# {asset_id: {'bids': [{'price': float, 'size': float}, ...], 'asks': [...]}}
+_curr_books: dict[str, dict] = {}
+_feature_buffer: list[dict]  = []
+
+_btc_price:    float = float('nan')
+_btc_open:     float = float('nan')
+_interval_end: int   = 0          # Unix-second timestamp of current interval end
+_last_pred_ts: float = 0.0
+
+
+def _get_interval_end() -> int:
+    return (int(time.time()) // 300) * 300 + 300
+
+
+def _compute_base_features() -> dict | None:
+    """Derive per-snapshot features from the current live order book."""
+    book = next(iter(_curr_books.values()), None)
+    if not book:
+        return None
+
+    bids = sorted(book['bids'], key=lambda x: -x['price'])
+    asks = sorted(book['asks'], key=lambda x:  x['price'])
+    if not bids or not asks:
+        return None
+
+    top_bids = bids[:_N_LEVELS]
+    top_asks = asks[:_N_LEVELS]
+
+    best_bid    = bids[0]['price']
+    best_ask    = asks[0]['price']
+    bid_vol     = sum(b['size'] for b in top_bids)
+    ask_vol     = sum(a['size'] for a in top_asks)
+    bid_vol_all = sum(b['size'] for b in bids)
+    ask_vol_all = sum(a['size'] for a in asks)
+
+    mid      = (best_bid + best_ask) / 2
+    spread   = best_ask - best_bid
+    denom_t  = bid_vol + ask_vol + 1e-9
+    denom_a  = bid_vol_all + ask_vol_all + 1e-9
+
+    bid_pxs  = sum(b['price'] * b['size'] for b in bids)
+    ask_pxs  = sum(a['price'] * a['size'] for a in asks)
+    micro    = (best_ask * bid_vol + best_bid * ask_vol) / denom_t
+
+    ts_ms    = int(time.time() * 1000)
+    i_start  = (_get_interval_end() - 300) * 1000
+
+    btc_from_open = (
+        _btc_price - _btc_open
+        if not (np.isnan(_btc_price) or np.isnan(_btc_open))
+        else float('nan')
+    )
+
+    row: dict = {
+        'best_bid':          best_bid,
+        'best_ask':          best_ask,
+        'bid_vol':           bid_vol,
+        'ask_vol':           ask_vol,
+        'bid_vol_all':       bid_vol_all,
+        'ask_vol_all':       ask_vol_all,
+        'bid_n_levels':      len(bids),
+        'ask_n_levels':      len(asks),
+        'mid':               mid,
+        'spread':            spread,
+        'rel_spread':        spread / (mid + 1e-9),
+        'imbalance':         (bid_vol - ask_vol) / denom_t,
+        'imbalance_all':     (bid_vol_all - ask_vol_all) / denom_a,
+        'microprice':        micro,
+        'micro_minus_mid':   micro - mid,
+        'vwap':              (bid_pxs + ask_pxs) / denom_a,
+        'btc_price':         _btc_price,
+        'btc_price_from_open': btc_from_open,
+        'time_in_interval_s': (ts_ms - i_start) / 1000.0,
+        'time_of_day_s':     (ts_ms // 1000) % 86400,
+    }
+
+    for i in range(_N_LEVELS):
+        row[f'bid_size_L{i+1}'] = top_bids[i]['size'] if i < len(top_bids) else 0.0
+        row[f'ask_size_L{i+1}'] = top_asks[i]['size'] if i < len(top_asks) else 0.0
+
+    return row
+
+
+def _try_predict() -> dict | None:
+    """Build feature vector from buffer and return predictions, or None."""
+    if _pipeline is None or not _feat_cols:
+        return None
+    if len(_feature_buffer) < _MIN_BUFFER:
+        return None
+
+    buf_df   = pd.DataFrame(_feature_buffer[-_MIN_BUFFER:]).reset_index(drop=True)
+    feat_df  = add_time_features(buf_df)
+    last_row = feat_df.iloc[[-1]]
+
+    # Fill any columns the model expects but are absent
+    for c in _feat_cols:
+        if c not in last_row.columns:
+            last_row = last_row.copy()
+            last_row[c] = float('nan')
+
+    X = last_row[_feat_cols].values.astype(float)
+    if np.any(np.isnan(X)):
+        return None
+
+    preds = _pipeline.predict(X)[0]   # (n_targets,)
+    return {tc: float(p) for tc, p in zip(_target_cols, preds)}
+
+
+# ──────────────────────────────────────────────────────────────
+# Background tasks
+# ──────────────────────────────────────────────────────────────
+
+async def poll_btc_price() -> None:
+    global _btc_price, _btc_open
+    while True:
+        try:
+            resp = requests.get(BINANCE_TICKER_URL, params={"symbol": "BTCUSDT"}, timeout=3)
+            price = float(resp.json()['price'])
+            _btc_price = price
+            if np.isnan(_btc_open):
+                _btc_open = price
+        except Exception as e:
+            logger.warning(f"BTC price poll failed: {e}")
+        await asyncio.sleep(2)
+
+
+# ──────────────────────────────────────────────────────────────
+# WebSocket helpers
+# ──────────────────────────────────────────────────────────────
+
 active_clients: set[WebSocket] = set()
 stream_task: Optional[asyncio.Task] = None
 current_token_ids: list[str] = []
 
 
-def get_token_ids(slug: str) -> tuple[list[str], dict]:
-    try:
-        resp = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, timeout=5).json()
-        if not resp:
-            return [], {}
-        market = resp[0]
-        token_ids = json.loads(market["clobTokenIds"])
-        return token_ids, market
-    except Exception as e:
-        logger.error(f"Error fetching market {slug}: {e}")
-        return [], {}
-
-
-async def broadcast(message: str):
+async def broadcast(message: str) -> None:
     dead = set()
     for client in active_clients:
         try:
@@ -54,25 +223,124 @@ async def broadcast(message: str):
     active_clients.difference_update(dead)
 
 
-async def run_polymarket_stream(token_ids: list[str]):
+def _apply_book_update(asset_id: str, msg: dict) -> None:
+    """Update _curr_books from a Polymarket book or price_change message."""
+    global _curr_books
+    event_type = msg.get('event_type')
+
+    if event_type == 'book':
+        _curr_books[asset_id] = {
+            'bids': [{'price': float(e['price']), 'size': float(e['size'])} for e in msg.get('bids', [])],
+            'asks': [{'price': float(e['price']), 'size': float(e['size'])} for e in msg.get('asks', [])],
+        }
+
+    elif event_type == 'price_change' and asset_id in _curr_books:
+        book = _curr_books[asset_id]
+        changes = msg.get('changes') or msg.get('price_changes') or []
+        for ch in changes:
+            price = float(ch['price'])
+            size  = float(ch['size'])
+            side  = 'bids' if ch['side'] == 'BUY' else 'asks'
+            arr   = book[side]
+            idx   = next((i for i, e in enumerate(arr) if e['price'] == price), -1)
+            if size == 0:
+                if idx >= 0:
+                    arr.pop(idx)
+            elif idx >= 0:
+                arr[idx]['size'] = size
+            else:
+                arr.append({'price': price, 'size': size})
+
+
+async def run_polymarket_stream(token_ids: list[str]) -> None:
+    global _curr_books, _feature_buffer, _last_pred_ts, _btc_open, _interval_end
+    _curr_books.clear()
+    _feature_buffer.clear()
+
     logger.info(f"Starting Polymarket stream for {len(token_ids)} tokens")
     try:
         async with websockets.connect(POLYMARKET_WS, ping_interval=5) as ws:
-            sub_msg = {
+            await ws.send(json.dumps({
                 "action": "subscribe",
                 "type": "market",
                 "assets_ids": token_ids,
                 "custom_feature_enabled": True,
-            }
-            await ws.send(json.dumps(sub_msg))
+            }))
+
             while True:
-                msg = await ws.recv()
-                await broadcast(msg)
+                raw = await ws.recv()
+                await broadcast(raw)
+
+                # Track book state
+                messages = json.loads(raw)
+                if not isinstance(messages, list):
+                    messages = [messages]
+
+                for m in messages:
+                    asset_id = m.get('asset_id')
+                    if asset_id:
+                        _apply_book_update(asset_id, m)
+
+                # Throttle predictions to ~1 Hz
+                now = time.time()
+                if now - _last_pred_ts < 1.0 or not _curr_books:
+                    continue
+                _last_pred_ts = now
+
+                # Reset buffer on interval rollover
+                interval_end = _get_interval_end()
+                if interval_end != _interval_end:
+                    _interval_end = interval_end
+                    _btc_open = _btc_price
+                    _feature_buffer.clear()
+
+                row = _compute_base_features()
+                if row is None:
+                    continue
+
+                _feature_buffer.append(row)
+                if len(_feature_buffer) > _MIN_BUFFER * 2:
+                    _feature_buffer = _feature_buffer[-_MIN_BUFFER * 2:]
+
+                preds = _try_predict()
+                if preds:
+                    await broadcast(json.dumps({
+                        'event_type':  'prediction',
+                        'timestamp':   int(now * 1000),
+                        'predictions': preds,
+                    }))
+
     except asyncio.CancelledError:
         logger.info("Stream cancelled")
     except Exception as e:
         logger.error(f"Stream error: {e}")
         await broadcast(json.dumps({"event_type": "error", "message": str(e)}))
+
+
+# ──────────────────────────────────────────────────────────────
+# App lifecycle
+# ──────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup() -> None:
+    _load_model()
+    asyncio.create_task(poll_btc_price())
+
+
+# ──────────────────────────────────────────────────────────────
+# REST endpoints
+# ──────────────────────────────────────────────────────────────
+
+def get_token_ids(slug: str) -> tuple[list[str], dict]:
+    try:
+        resp = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, timeout=5).json()
+        if not resp:
+            return [], {}
+        market = resp[0]
+        return json.loads(market["clobTokenIds"]), market
+    except Exception as e:
+        logger.error(f"Error fetching market {slug}: {e}")
+        return [], {}
 
 
 @app.get("/api/market/{slug}")
@@ -81,16 +349,15 @@ def get_market(slug: str):
     if not token_ids:
         return {"error": "Market not found"}
     return {
-        "slug": slug,
+        "slug":      slug,
         "token_ids": token_ids,
-        "question": market.get("question"),
-        "end_date": market.get("endDate"),
+        "question":  market.get("question"),
+        "end_date":  market.get("endDate"),
     }
 
 
 @app.get("/api/markets/active")
 def get_active_markets():
-    """Detect currently active BTC updown markets (5m and 15m intervals)."""
     current_time = int(time.time())
     markets = []
     for interval, label in [(300, "5m"), (900, "15m")]:
@@ -99,13 +366,17 @@ def get_active_markets():
         token_ids, market = get_token_ids(slug)
         if token_ids:
             markets.append({
-                "slug": slug,
-                "label": f"BTC {label}",
+                "slug":      slug,
+                "label":     f"BTC {label}",
                 "token_ids": token_ids,
-                "question": market.get("question"),
+                "question":  market.get("question"),
             })
     return markets
 
+
+# ──────────────────────────────────────────────────────────────
+# WebSocket endpoint
+# ──────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -117,7 +388,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            msg = json.loads(data)
+            msg  = json.loads(data)
 
             if msg.get("action") == "subscribe":
                 slug = msg.get("slug", "").strip()
@@ -128,25 +399,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not token_ids:
                     await websocket.send_text(json.dumps({
                         "event_type": "error",
-                        "message": f"Market not found: {slug}",
+                        "message":    f"Market not found: {slug}",
                     }))
                     continue
 
-                # Restart stream if switching to a different market
                 if token_ids != current_token_ids:
                     if stream_task and not stream_task.done():
                         stream_task.cancel()
                         await asyncio.sleep(0.1)
                     current_token_ids = token_ids
-                    stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
-
+                    stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
                 elif not stream_task or stream_task.done():
-                    stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
+                    stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
 
                 await websocket.send_text(json.dumps({
                     "event_type": "subscribed",
-                    "slug": slug,
-                    "token_ids": token_ids,
+                    "slug":       slug,
+                    "token_ids":  token_ids,
                 }))
 
     except WebSocketDisconnect:

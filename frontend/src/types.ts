@@ -15,6 +15,12 @@ export interface PricePoint {
   midPrice: number
   bestBid: number
   bestAsk: number
+  predMid?: number   // model's target_5s prediction made ~5 s ago
+}
+
+export interface PredictionPoint {
+  time: number
+  predictions: Record<string, number>
 }
 
 export interface MarketEvent {
@@ -28,6 +34,8 @@ export interface MarketEvent {
 export interface MarketState {
   orderBooks: Record<string, OrderBook>
   priceHistory: PricePoint[]
+  predictionHistory: PredictionPoint[]
+  latestPredictions: Record<string, number> | null
   events: MarketEvent[]
   status: 'disconnected' | 'connecting' | 'connected' | 'error'
   error?: string

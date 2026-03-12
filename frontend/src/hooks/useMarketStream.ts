@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { MarketState, OrderBook, PricePoint, MarketEvent, OrderBookEntry } from '../types'
+import type { MarketState, OrderBook, PricePoint, PredictionPoint, MarketEvent, OrderBookEntry } from '../types'
 
 const WS_URL = 'ws://localhost:8000/ws'
-const MAX_PRICE_HISTORY = 300
-const MAX_EVENTS = 100
+const MAX_PRICE_HISTORY  = 300
+const MAX_PRED_HISTORY   = 300
+const MAX_EVENTS         = 100
+const PRED_HORIZON_MS    = 5000  // target_5s prediction horizon
 
 function getMidPrice(books: Record<string, OrderBook>): PricePoint | null {
   const book = Object.values(books)[0]
@@ -28,22 +30,27 @@ export function useMarketStream(slug: string | null) {
   const [state, setState] = useState<MarketState>({
     orderBooks: {},
     priceHistory: [],
+    predictionHistory: [],
+    latestPredictions: null,
     events: [],
     status: 'disconnected',
   })
 
   const wsRef = useRef<WebSocket | null>(null)
   const eventIdRef = useRef(0)
-  // Keep a ref to current order books so onmessage handler stays current
   const booksRef = useRef<Record<string, OrderBook>>({})
+  const predHistoryRef = useRef<PredictionPoint[]>([])
 
   const connect = useCallback((targetSlug: string) => {
     wsRef.current?.close()
     booksRef.current = {}
+    predHistoryRef.current = []
 
     setState({
       orderBooks: {},
       priceHistory: [],
+      predictionHistory: [],
+      latestPredictions: null,
       events: [],
       status: 'connecting',
     })
@@ -64,10 +71,27 @@ export function useMarketStream(slug: string | null) {
         const newBooks = { ...booksRef.current }
         const newEvents: MarketEvent[] = [...prev.events]
         let priceUpdated = false
+        let newPredHistory = prev.predictionHistory
+        let newLatestPreds = prev.latestPredictions
 
         for (const msg of messages) {
           const eventType = msg.event_type as string ?? 'unknown'
           const assetId = msg.asset_id as string | undefined
+
+          // Handle prediction events separately — don't add to event feed
+          if (eventType === 'prediction') {
+            const predPoint: PredictionPoint = {
+              time: msg.timestamp as number,
+              predictions: msg.predictions as Record<string, number>,
+            }
+            predHistoryRef.current = [
+              ...predHistoryRef.current,
+              predPoint,
+            ].slice(-MAX_PRED_HISTORY)
+            newPredHistory = predHistoryRef.current
+            newLatestPreds = predPoint.predictions
+            continue
+          }
 
           newEvents.unshift({
             id: ++eventIdRef.current,
@@ -105,8 +129,8 @@ export function useMarketStream(slug: string | null) {
 
             newBooks[assetId] = {
               ...existing,
-              bids: bids.sort((a, b) => b.price - a.price),
-              asks: asks.sort((a, b) => a.price - b.price),
+              bids: bids.sort((b1, b2) => b2.price - b1.price),
+              asks: asks.sort((a1, a2) => a1.price - a2.price),
               timestamp: Date.now(),
             }
             priceUpdated = true
@@ -119,13 +143,23 @@ export function useMarketStream(slug: string | null) {
         if (priceUpdated) {
           const point = getMidPrice(newBooks)
           if (point) {
-            newPriceHistory = [...prev.priceHistory, point].slice(-MAX_PRICE_HISTORY)
+            // Find prediction made ~PRED_HORIZON_MS ago to compare against this moment
+            const targetTime = point.time - PRED_HORIZON_MS
+            const match = predHistoryRef.current.find(
+              p => Math.abs(p.time - targetTime) < 1500
+            )
+            const enriched: PricePoint = match
+              ? { ...point, predMid: match.predictions['target_5s'] }
+              : point
+            newPriceHistory = [...prev.priceHistory, enriched].slice(-MAX_PRICE_HISTORY)
           }
         }
 
         return {
           ...prev,
           orderBooks: newBooks,
+          predictionHistory: newPredHistory,
+          latestPredictions: newLatestPreds,
           priceHistory: newPriceHistory,
           events: newEvents.slice(0, MAX_EVENTS),
         }
