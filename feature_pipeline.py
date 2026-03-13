@@ -4,9 +4,13 @@ feature_pipeline.py
 End-to-end pipeline:
   1. Load raw orderbook snapshots from raw_book_data/
   2. Extract per-timestamp features (best prices, depth, imbalance, microprice)
-  3. Add time-lagged / rolling features
-  4. Build target: mid price 5 seconds ahead
-  5. Train a GradientBoostingRegressor with TimeSeriesSplit CV
+  3. Build targets on raw [0,1] tick data (before downsampling and logit transform):
+       target_logit_change : logit(mid_{t+10s}) − logit(mid_t)
+       target_mid_anchor   : raw [0,1] mid at t (for plot reconstruction only)
+  4. Apply logit transform to price features (mid, best_bid, best_ask, microprice, vwap)
+  5. Downsample: feature columns via mean (or last), target columns always via last
+  6. Add time-lagged / rolling features (now in logit space for price cols)
+  7. Train a model with TimeSeriesSplit CV
 """
 
 import os
@@ -17,9 +21,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import sklearn
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -141,12 +144,50 @@ def filter_to_last_per_second(feat: pd.DataFrame, interval_ms: int = 1000, mean=
     Parameters
     ----------
     interval_ms : interval width in milliseconds (default 1000 = 1 second)
-    mean : If True, the mean is used to downsample points in the same interval instead of the last element. 
+    mean : If True, the mean is used to downsample points in the same interval instead of the last element.
     The default behaviour is False.
     """
     bins = feat.index // interval_ms
     result = feat.groupby(bins).last() if not mean else feat.groupby(bins).mean()
     result.index = result.index * interval_ms  # restore ms scale
+    return result
+
+
+def downsample_features(feat: pd.DataFrame, interval_ms: int = 1000, mean: bool = False) -> pd.DataFrame:
+    """
+    Downsample a feature DataFrame to one row per interval with richer aggregation
+    for price columns.
+
+    Price columns (_LOGIT_PRICE_COLS present in feat):
+      - Point value : last tick in the interval (always, regardless of `mean`)
+      - Extra cols  : <col>_imax, <col>_imin, <col>_istd — interval max / min / std
+
+    All other columns:
+      - last tick when mean=False, interval mean when mean=True
+
+    Target columns should NOT be passed here; downsample them separately with
+    filter_to_last_per_second(..., mean=False).
+    """
+    bins = feat.index // interval_ms
+
+    price_cols = [c for c in _LOGIT_PRICE_COLS if c in feat.columns]
+    other_cols = [c for c in feat.columns if c not in price_cols]
+
+    parts = []
+    if price_cols:
+        grp = feat[price_cols].groupby(bins)
+        parts += [
+            grp.last(),
+            grp.max().add_suffix('_imax'),
+            grp.min().add_suffix('_imin'),
+            grp.std().add_suffix('_istd'),
+        ]
+    if other_cols:
+        grp = feat[other_cols].groupby(bins)
+        parts.append(grp.mean() if mean else grp.last())
+
+    result = pd.concat(parts, axis=1)
+    result.index = result.index * interval_ms
     return result
 
 
@@ -176,17 +217,49 @@ def add_interval_features(feat: pd.DataFrame, file_ts_s: int) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# 4. Time-lagged & rolling features
+# 4. Logit transform for price features
+# ──────────────────────────────────────────────────────────────
+
+# Columns representing [0,1] prediction-market prices to be logit-transformed.
+# btc_price is excluded — it is a USD spot price, not a probability.
+_LOGIT_PRICE_COLS = ['mid', 'best_bid', 'best_ask', 'microprice', 'vwap']
+
+
+def apply_logit_to_prices(feat: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform [0,1] price columns to logit (log-odds) space in-place, then
+    recompute the derived features that reference absolute price levels so they
+    remain consistent.
+
+    IMPORTANT: call this AFTER add_target (which needs raw [0,1] prices) and
+               BEFORE downsampling / add_time_features.
+    """
+    for col in _LOGIT_PRICE_COLS:
+        if col in feat.columns:
+            feat[col] = _logit(feat[col].values)
+
+    # Recompute derived features now that base prices are in logit space
+    if 'best_bid' in feat.columns and 'best_ask' in feat.columns:
+        feat['spread']     = feat['best_ask'] - feat['best_bid']
+        feat['rel_spread'] = feat['spread'] / (feat['mid'].abs() + _LOGIT_EPS)
+    if 'microprice' in feat.columns and 'mid' in feat.columns:
+        feat['micro_minus_mid'] = feat['microprice'] - feat['mid']
+
+    return feat
+
+
+# ──────────────────────────────────────────────────────────────
+# 5. Time-lagged & rolling features
 # ──────────────────────────────────────────────────────────────
 
 # Columns to lag
 _LAG_COLS    = ['mid', 'spread', 'rel_spread', 'imbalance', 'imbalance_all',
                 'microprice', 'micro_minus_mid', 'bid_vol', 'ask_vol',
                 'btc_price', 'btc_price_from_open', 'vwap', 'ofi']
-_LAGS        = list(range(10)) #[1, 2, 5, 10, 20]
+_LAGS        = list(range(5)) #[1, 2, 5, 10, 20]
 _DIFF_COLS   = ['mid', 'spread', 'imbalance']
 _ROLL_COLS   = ['mid', 'imbalance', 'spread']
-_ROLL_WINS   = [5, 10, 20]
+_ROLL_WINS   = [5, 10]
 
 
 def add_time_features(feat: pd.DataFrame) -> pd.DataFrame:
@@ -216,34 +289,56 @@ def add_time_features(feat: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# 5. Build target: mid price N ms ahead
+# 5. Build targets on raw [0,1] tick data (BEFORE logit transform + downsampling)
 # ──────────────────────────────────────────────────────────────
 
-def add_target(feat: pd.DataFrame, horizon_ms: int = 5000, step_ms: int = 1000) -> pd.DataFrame:
-    """
-    For each row at timestamp t, find the mid price at each step within the
-    horizon window and record them as separate target columns.
+_LOGIT_EPS = 1e-6  # clip prices away from 0/1 before logit
 
-    With the defaults this produces targets at t+1s, t+2s, t+3s, t+4s, t+5s.
+
+def _logit(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, _LOGIT_EPS, 1 - _LOGIT_EPS)
+    return np.log(x / (1 - x))
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def add_target(feat: pd.DataFrame, horizon_ms: int = 10000) -> pd.DataFrame:
+    """
+    Compute targets on raw [0,1] tick data, before any logit transform or
+    downsampling, so neither corrupts the labels.
+
+    IMPORTANT: call this before apply_logit_to_prices and
+               filter_to_last_per_second.
 
     Columns added:
-      target_<k>s      : mid price at t + k*step_ms  (k = 1 … n_steps)
-      target_diff_<k>s : mid price change from current mid
+      target_logit_change : logit(mid_{t+horizon}) − logit(mid_t)
+      target_mid_anchor   : raw [0,1] mid at t — not a model target, used only
+                            for price-band reconstruction in plots
     """
     ts_arr  = feat.index.values
     mid_arr = feat['mid'].values
-    n_steps = horizon_ms // step_ms
+    logit_mid = _logit(mid_arr)
 
-    for k in range(1, n_steps + 1):
-        offset = k * step_ms
-        future_mid = np.full(len(ts_arr), np.nan)
-        for i, t in enumerate(ts_arr):
-            j = np.searchsorted(ts_arr, t + offset)
-            if j < len(ts_arr):
-                future_mid[i] = mid_arr[j]
-        feat[f'target_{k}s']      = future_mid
-        feat[f'target_diff_{k}s'] = future_mid - mid_arr
+    logit_change = np.full(len(ts_arr), np.nan)
+    volatility   = np.full(len(ts_arr), np.nan)
 
+    for i, t in enumerate(ts_arr):
+        j = np.searchsorted(ts_arr, t + horizon_ms)
+        if j < len(ts_arr):
+            logit_change[i] = logit_mid[j] - logit_mid[i]
+
+        # Realized vol: std of logit changes over [t, t+horizon]
+        mask = (ts_arr >= t) & (ts_arr <= t + horizon_ms)
+        window_logits = logit_mid[mask]
+        if len(window_logits) > 1:
+            volatility[i] = float(np.std(np.diff(window_logits)))
+
+    feat['target_logit_change'] = logit_change
+    # Anchor: raw [0,1] mid — downsampled with 'last' alongside targets so it
+    # stays consistent with the logit-change base for reconstruction.
+    feat['target_mid_anchor']   = mid_arr
     return feat
 
 
@@ -255,141 +350,134 @@ def _rmse(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
 
-def _supports_multioutput(estimator) -> bool:
-    """Return True if estimator natively handles multi-output targets."""
-    if isinstance(estimator, MultiOutputRegressor):
-        return True
-    # sklearn >= 1.6 uses __sklearn_tags__; older versions use _get_tags()
-    try:
-        return estimator.__sklearn_tags__().target_tags.multi_output
-    except AttributeError:
-        pass
-    try:
-        return estimator._get_tags().get('multioutput', False)
-    except AttributeError:
-        return False
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> float:
+    """Pinball (quantile) loss for a single quantile alpha ∈ (0, 1)."""
+    err = y_true - y_pred
+    return float(np.mean(np.where(err >= 0, alpha * err, (alpha - 1) * err)))
 
 
-def _get_feature_importances(model, feat_cols: list[str]) -> pd.Series | None:
+
+class QuantileGBR:
     """
-    Extract feature importances from a fitted model regardless of whether it
-    is a MultiOutputRegressor wrapper or a native multi-output estimator.
-    Returns None if the model type doesn't expose importances.
+    Trains one GradientBoostingRegressor(loss='quantile', alpha=q) per quantile.
+    Accepts a 1-D target and produces (n_samples, n_quantiles) predictions.
+
+    Parameters
+    ----------
+    quantiles     : tuple of quantile levels in (0, 1), e.g. (0.1, 0.25, 0.5, 0.75, 0.9)
+    n_estimators  : trees per quantile model
+    max_depth     : max tree depth
+    learning_rate : GBR learning rate
     """
-    # Unwrapped MultiOutputRegressor: average across per-output estimators
-    if isinstance(model, MultiOutputRegressor) and hasattr(model, 'estimators_'):
-        arrays = [e.feature_importances_ for e in model.estimators_
-                  if hasattr(e, 'feature_importances_')]
-        if arrays:
-            return pd.Series(np.mean(arrays, axis=0), index=feat_cols)
-        return None
-    # Native multi-output model (e.g. RandomForest)
-    if hasattr(model, 'feature_importances_'):
-        return pd.Series(model.feature_importances_, index=feat_cols)
-    return None
+    def __init__(
+        self,
+        quantiles: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9),
+        n_estimators: int = 300,
+        max_depth: int = 4,
+        learning_rate: float = 0.05,
+    ):
+        self.quantiles     = quantiles
+        self.n_estimators  = n_estimators
+        self.max_depth     = max_depth
+        self.learning_rate = learning_rate
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> 'QuantileGBR':
+        y = np.asarray(y).ravel()
+        self.estimators_ = [
+            GradientBoostingRegressor(
+                loss='quantile', alpha=q,
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                random_state=42,
+            ).fit(X, y)
+            for q in self.quantiles
+        ]
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Returns shape (n_samples, n_quantiles)."""
+        return np.column_stack([e.predict(X) for e in self.estimators_])
 
 
-def baseline_metrics(y_true, y_current_mid):
-    """Naive baseline: predict current mid = future mid (no-change)."""
-    mae  = mean_absolute_error(y_true, y_current_mid)
-    rmse = _rmse(y_true, y_current_mid)
-    r2   = r2_score(y_true, y_current_mid)
-    print(f'  Baseline (no-change): MAE={mae:.6f}  RMSE={rmse:.6f}  R²={r2:.4f}')
-    return mae, rmse, r2
+def baseline_metrics(y_true: np.ndarray, target_name: str = '') -> None:
+    """Naive zero baseline (predict no logit change)."""
+    y_zero = np.zeros_like(y_true)
+    mae  = mean_absolute_error(y_true, y_zero)
+    rmse = _rmse(y_true, y_zero)
+    r2   = r2_score(y_true, y_zero)
+    label = f' [{target_name}]' if target_name else ''
+    print(f'  Baseline (zero){label}: MAE={mae:.6f}  RMSE={rmse:.6f}  R²={r2:.4f}')
 
 
 def train_and_evaluate(
     feat: pd.DataFrame,
     target_cols: list[str] | None = None,
-    model=None,
+    model: QuantileGBR | None = None,
     n_splits: int = 5,
 ) -> tuple[Pipeline, list[str], list[str]]:
     """
-    Train a MultiOutputRegressor(GradientBoostingRegressor) using TimeSeriesSplit CV.
+    Train a QuantileGBR using TimeSeriesSplit CV.
+
+    The model fits on a single 1-D target (target_logit_change) and predicts
+    one value per quantile level.  CV reports pinball loss per quantile and MAE
+    for the median quantile.
 
     Parameters
     ----------
-    feat        : feature DataFrame (output of full pipeline)
-    target_cols : list of target column names to predict; defaults to all
-                  target_<k>s columns found in feat
-    model       : sklearn estimator for a single output; defaults to
-                  GradientBoostingRegressor wrapped in MultiOutputRegressor
+    feat        : feature DataFrame (output of build_pipeline)
+    target_cols : single-element list, defaults to ['target_logit_change']
+    model       : QuantileGBR instance; constructed with defaults if None
     n_splits    : number of TimeSeriesSplit folds
 
     Returns
     -------
-    pipeline    : fitted Pipeline(StandardScaler + MultiOutputRegressor) on all data
-    feat_cols   : list of feature column names used
-    target_cols : list of target column names predicted
+    pipeline    : fitted Pipeline(MinMaxScaler → QuantileGBR)
+    feat_cols   : feature column names used
+    target_cols : target column names (always ['target_logit_change'])
     """
     all_target_cols = [c for c in feat.columns if c.startswith('target_')]
     if target_cols is None:
-        target_cols = sorted(
-            [c for c in all_target_cols if not c.startswith('target_diff_')],
-            key=lambda c: int(c.split('_')[1].rstrip('s'))
-        )
+        target_cols = [c for c in all_target_cols
+                       if c not in ('target_mid_anchor',)]
 
     feat_cols = [c for c in feat.columns if c not in set(all_target_cols)]
 
     clean = feat[feat_cols + target_cols].dropna()
     X = clean[feat_cols].values
-    Y = clean[target_cols].values  # shape (n_samples, n_steps)
+    y = clean[target_cols].values.ravel()   # 1-D
 
-    mid_idx = feat_cols.index('mid')
-    y_mid   = X[:, mid_idx]
-
-    print(f'\nDataset: {len(clean):,} rows × {len(feat_cols)} features → {len(target_cols)} targets')
-    print(f'Targets: {target_cols}')
-    print(f'\n--- Baseline (per target) ---')
-    for k in range(len(target_cols)):
-        baseline_metrics(Y[:, k], y_mid)
+    print(f'\nDataset: {len(clean):,} rows × {len(feat_cols)} features')
+    print(f'Target : {target_cols}')
+    print(f'\n--- Baseline (zero logit-change prediction) ---')
+    baseline_metrics(y, target_cols[0])
 
     if model is None:
-        model = GradientBoostingRegressor(
-            loss='absolute_error',
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=1,
-            min_samples_leaf=1,
-            random_state=42,
-        )
+        model = QuantileGBR()
 
-    if not _supports_multioutput(model):
-        model = MultiOutputRegressor(model, n_jobs=-1)
-    # TODO: Add Column Transformer to exclude time_of_day from midnight feature from MinMaxScaling
     pipeline = Pipeline([('scaler', MinMaxScaler()), ('model', model)])
     tscv     = TimeSeriesSplit(n_splits=n_splits)
+    quantiles = np.asarray(model.quantiles)
+    median_idx = int(np.argmin(np.abs(quantiles - 0.5)))
 
     print(f'\n--- TimeSeriesSplit CV ({n_splits} folds) ---')
-    fold_maes, fold_rmses, fold_r2s = [], [], []
+    print(f'Quantiles: {list(quantiles)}')
 
     for fold, (tr_idx, val_idx) in enumerate(tscv.split(X)):
-        pipeline.fit(X[tr_idx], Y[tr_idx])
-        preds = pipeline.predict(X[val_idx])  # (n_val, n_steps)
+        pipeline.fit(X[tr_idx], y[tr_idx])
+        preds = pipeline.predict(X[val_idx])          # (n_val, n_quantiles)
+        y_val = y[val_idx]
 
-        mae  = mean_absolute_error(Y[val_idx], preds)
-        rmse = np.sqrt(mean_squared_error(Y[val_idx], preds))
-        r2   = r2_score(Y[val_idx], preds)
+        pinball = [_pinball_loss(y_val, preds[:, i], q)
+                   for i, q in enumerate(quantiles)]
+        mae_med = mean_absolute_error(y_val, preds[:, median_idx])
 
-        fold_maes.append(mae)
-        fold_rmses.append(rmse)
-        fold_r2s.append(r2)
-        print(f'  Fold {fold+1}: MAE={mae:.6f}  RMSE={rmse:.6f}  R²={r2:.4f}  '
+        pb_str = '  '.join(f'q{q:.2f}={pb:.5f}' for q, pb in zip(quantiles, pinball))
+        print(f'  Fold {fold+1}: MedianMAE={mae_med:.6f}  Pinball [{pb_str}]  '
               f'(n_train={len(tr_idx):,}  n_val={len(val_idx):,})')
 
-    print(f'\n  Mean   MAE={np.mean(fold_maes):.6f}  '
-          f'RMSE={np.mean(fold_rmses):.6f}  R²={np.mean(fold_r2s):.4f}')
-
     # Refit on full dataset
-    pipeline.fit(X, Y)
-
-    # # Feature importances (if the model exposes them)
-    # imp = _get_feature_importances(pipeline.named_steps['model'], feat_cols)
-    # if imp is not None:
-    #     print(f'\n--- Top 20 feature importances (mean across outputs) ---')
-    #     print(imp.sort_values(ascending=False).head(20).to_string())
-
+    pipeline.fit(X, y)
     return pipeline, feat_cols, target_cols
 
 
@@ -403,16 +491,22 @@ def plot_predictions(
     feat_cols: list[str],
     target_cols: list[str],
     n_levels: int = 5,
-    horizon_ms: int = 5000,
+    horizon_ms: int = 10000,
     downsample_ms: int = 1000,
     mean: bool = False,
     save_path: str | None = None,
 ) -> None:
     """
-    Run the feature pipeline on a single .pkl file, generate multi-output
-    predictions, and plot actual vs predicted for each horizon step.
+    Run the feature pipeline on a single .pkl file and produce a three-panel figure:
 
-    One row of subplots per target (actual + predicted on top, residuals below).
+      Top    : Price band plot — current mid, actual future mid, predicted median,
+               and shaded bands for each symmetric quantile pair (e.g. 10%–90%, 25%–75%).
+      Bottom : logit_change actual vs predicted median with quantile shading (left)
+               and residuals (right).
+
+    Price band is derived as (all in [0,1] via sigmoid):
+      predicted_future_mid = sigmoid(logit(anchor) + pred_q50)
+      band_upper / lower   = sigmoid(logit(anchor) + pred_q_hi / pred_q_lo)
 
     Parameters
     ----------
@@ -425,12 +519,27 @@ def plot_predictions(
     df = pd.read_pickle(pkl_path)
 
     feat = extract_features(df, n_levels=n_levels)
-    feat = filter_to_last_per_second(feat, interval_ms=downsample_ms, mean=mean)
-    feat = add_interval_features(feat, file_ts_s)
-    feat = add_time_features(feat)
+
+    # Build targets on raw [0,1] tick data BEFORE logit transform or downsampling
     feat = add_target(feat, horizon_ms=horizon_ms)
 
-    needed = feat_cols + target_cols
+    # Transform price features to logit space
+    feat = apply_logit_to_prices(feat)
+
+    # Downsample: price features → last + interval stats; other features → mean/last;
+    # targets → always last (never averaged).
+    target_cols_raw = [c for c in feat.columns if c.startswith('target_')]
+    feat_cols_raw   = [c for c in feat.columns if not c.startswith('target_')]
+    feat_ds    = downsample_features(feat[feat_cols_raw], interval_ms=downsample_ms, mean=mean)
+    targets_ds = filter_to_last_per_second(feat[target_cols_raw], interval_ms=downsample_ms, mean=False)
+    feat = feat_ds.join(targets_ds)
+
+    feat = add_interval_features(feat, file_ts_s)
+    feat = add_time_features(feat)
+
+    # target_mid_anchor is not in target_cols (excluded from model outputs) but
+    # we need it for price-band reconstruction.
+    needed = feat_cols + target_cols + ['target_mid_anchor']
     missing = [c for c in needed if c not in feat.columns]
     if missing:
         raise ValueError(f'Columns missing from file features: {missing}')
@@ -440,48 +549,90 @@ def plot_predictions(
         raise ValueError('No complete rows after dropping NaNs.')
 
     X      = clean[feat_cols].values
-    Y_true = clean[target_cols].values          # (n_rows, n_steps)
-    Y_pred = pipeline.predict(X)                # (n_rows, n_steps)
+    Y_true = clean[target_cols].values   # (n_rows, n_targets)
+    Y_pred = pipeline.predict(X)         # (n_rows, n_targets)
 
     timestamps = pd.to_datetime(clean.index, unit='ms', utc=True)
-    n_steps    = len(target_cols)
+    mid_anchor = clean['target_mid_anchor'].values
+    logit_anchor = _logit(mid_anchor)
+    true_lc = Y_true.ravel()                     # actual logit changes, 1-D
 
-    fig, axes = plt.subplots(n_steps, 2, figsize=(14, 3.5 * n_steps), sharex=True)
-    if n_steps == 1:
-        axes = axes[np.newaxis, :]  # keep 2-D indexing for single target
+    # Y_pred is (n_rows, n_quantiles) from QuantileGBR
+    inner_model = pipeline.named_steps['model']
+    quantiles   = np.asarray(inner_model.quantiles)
+    median_idx  = int(np.argmin(np.abs(quantiles - 0.5)))
+    pred_median = Y_pred[:, median_idx]
 
-    fig.suptitle(f'Actual vs Predicted — {os.path.basename(pkl_path)}', fontsize=13)
+    # Build symmetric quantile pairs for bands, widest first
+    pairs: list[tuple[int, int, str]] = []
+    for i, q in enumerate(quantiles):
+        if q >= 0.5:
+            continue
+        mirror = 1.0 - q
+        j_arr = np.where(np.isclose(quantiles, mirror))[0]
+        if len(j_arr):
+            pairs.append((i, int(j_arr[0]), f'{q:.0%}–{mirror:.0%}'))
+    pairs.sort(key=lambda t: quantiles[t[1]] - quantiles[t[0]], reverse=True)
 
-    for i, tc in enumerate(target_cols):
-        y_true = Y_true[:, i]
-        y_pred = Y_pred[:, i]
-        mae  = mean_absolute_error(y_true, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-        r2   = r2_score(y_true, y_pred)
+    # ── Layout: 2 rows × 2 cols; top row spans both columns ──────────────────
+    fig = plt.figure(figsize=(14, 9))
+    gs  = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.3)
+    ax_band = fig.add_subplot(gs[0, :])
+    ax_lc   = fig.add_subplot(gs[1, 0])
+    ax_res  = fig.add_subplot(gs[1, 1], sharex=ax_lc)
 
-        # Left: actual vs predicted
-        ax = axes[i, 0]
-        ax.plot(timestamps, y_true, label='Actual',    linewidth=1.1)
-        ax.plot(timestamps, y_pred, label='Predicted', linewidth=1.1, linestyle='--', alpha=0.85)
-        ax.set_ylabel(tc)
-        ax.set_title(f'{tc}  MAE={mae:.5f}  RMSE={rmse:.5f}  R²={r2:.4f}', fontsize=9)
-        ax.legend(loc='upper right', fontsize=8)
+    fig.suptitle(f'Quantile Predictions & Price Bands — {os.path.basename(pkl_path)}',
+                 fontsize=13)
+    bar_w = pd.Timedelta(milliseconds=downsample_ms * 0.8)
 
-        # Right: residuals
-        ax2 = axes[i, 1]
-        residuals = y_pred - y_true
-        ax2.bar(timestamps, residuals,
-                width=pd.Timedelta(milliseconds=downsample_ms * 0.8),
-                color='steelblue', alpha=0.6)
-        ax2.axhline(0, color='black', linewidth=0.8)
-        ax2.set_ylabel('Residual (pred − actual)')
-        ax2.set_title(f'{tc} residuals', fontsize=9)
+    # ── Top panel: price bands in [0,1] ──────────────────────────────────────
+    actual_future_mid = _sigmoid(logit_anchor + true_lc)
+    pred_future_mid   = _sigmoid(logit_anchor + pred_median)
 
-    for ax in axes[-1]:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax_band.plot(timestamps, mid_anchor,        color='grey',      lw=1.0, label='Mid (anchor)',        zorder=3)
+    ax_band.plot(timestamps, actual_future_mid, color='steelblue', lw=1.2, label='Actual future mid',   zorder=4)
+    ax_band.plot(timestamps, pred_future_mid,   color='tomato',    lw=1.2, linestyle='--',
+                 label=f'Predicted median (q{quantiles[median_idx]:.0%})', zorder=5)
+
+    band_alphas = np.linspace(0.30, 0.10, max(len(pairs), 1))
+    for (lo_idx, hi_idx, label), alpha in zip(pairs, band_alphas):
+        upper = _sigmoid(logit_anchor + Y_pred[:, hi_idx])
+        lower = _sigmoid(logit_anchor + Y_pred[:, lo_idx])
+        ax_band.fill_between(timestamps, lower, upper,
+                             color='tomato', alpha=alpha, label=f'Band {label}', zorder=2)
+
+    ax_band.set_ylabel('Price [0, 1]')
+    ax_band.set_title(f'Price bands at t+{horizon_ms // 1000}s  '
+                      f'— sigmoid(logit(anchor) + quantile_prediction)', fontsize=9)
+    ax_band.legend(loc='upper right', fontsize=8, ncol=3)
+    ax_band.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+
+    # ── Bottom-left: logit_change actual vs median + quantile shading ─────────
+    mae = mean_absolute_error(true_lc, pred_median)
+    r2  = r2_score(true_lc, pred_median)
+    ax_lc.plot(timestamps, true_lc,    color='steelblue', lw=1.1, label='Actual',         zorder=4)
+    ax_lc.plot(timestamps, pred_median, color='tomato',   lw=1.1, linestyle='--',
+               label='Predicted median', zorder=5)
+
+    for (lo_idx, hi_idx, label), alpha in zip(pairs, band_alphas):
+        ax_lc.fill_between(timestamps, Y_pred[:, lo_idx], Y_pred[:, hi_idx],
+                           color='tomato', alpha=alpha, label=f'Band {label}', zorder=2)
+
+    ax_lc.axhline(0, color='black', lw=0.7, linestyle=':')
+    ax_lc.set_ylabel('logit change')
+    ax_lc.set_title(f'Logit change  MAE={mae:.5f}  R²={r2:.4f}', fontsize=9)
+    ax_lc.legend(loc='upper right', fontsize=8)
+    ax_lc.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+
+    # ── Bottom-right: residuals (actual − median) ─────────────────────────────
+    residuals = pred_median - true_lc
+    ax_res.bar(timestamps, residuals, width=bar_w, color='steelblue', alpha=0.6)
+    ax_res.axhline(0, color='black', lw=0.8)
+    ax_res.set_ylabel('Residual (pred − actual)')
+    ax_res.set_title('Logit-change residuals (median)', fontsize=9)
+    ax_res.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
 
     fig.autofmt_xdate()
-    plt.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f'Plot saved to {save_path}')
@@ -528,10 +679,25 @@ def build_pipeline(
         file_ts_s = _file_ts_from_path(p)
 
         feat = extract_features(df, n_levels=n_levels)
-        feat = filter_to_last_per_second(feat, interval_ms=downsample_ms, mean=mean)
+
+        # Build targets on raw [0,1] tick data BEFORE logit transform or downsampling.
+        print(f'  {os.path.basename(p)}: building targets on {len(feat)} raw ticks...')
+        feat = add_target(feat, horizon_ms=horizon_ms)
+
+        # Transform price features to logit space AFTER targets are computed.
+        feat = apply_logit_to_prices(feat)
+
+        # Downsample: price features → last + interval stats; other features → mean/last;
+        # targets → always last (never averaged).
+        target_cols_raw = [c for c in feat.columns if c.startswith('target_')]
+        feat_cols_raw   = [c for c in feat.columns if not c.startswith('target_')]
+        feat_ds    = downsample_features(feat[feat_cols_raw], interval_ms=downsample_ms, mean=mean)
+        targets_ds = filter_to_last_per_second(feat[target_cols_raw], interval_ms=downsample_ms, mean=False)
+        feat = feat_ds.join(targets_ds)
+
         feat = add_interval_features(feat, file_ts_s)
         per_file_feats.append(feat)
-        print(f'  {os.path.basename(p)}: {len(feat)} rows after {downsample_ms}ms filter')
+        print(f'  {os.path.basename(p)}: {len(feat)} rows after {downsample_ms}ms downsample')
 
     feat = pd.concat(per_file_feats).sort_index()
     print(f'Total: {len(feat):,} rows across {len(paths)} file(s)')
@@ -539,22 +705,17 @@ def build_pipeline(
     print('Adding time-lagged features...')
     feat = add_time_features(feat)
 
-    print(f'Adding target (horizon={horizon_ms}ms)...')
-    feat = add_target(feat, horizon_ms=horizon_ms)
-
     return feat
 
 
 if __name__ == '__main__':
-    MODEL_NAME = 'model_mean_downsample'
+    MODEL_NAME = 'model_log_ret'
     DATA_DIR    = 'raw_book_data'
     N_LEVELS    = 5
-    HORIZON_MS  = 5000
+    HORIZON_MS  = 10000   # predict log return and volatility at t+10s
     DOWNSAMPLE  = 1000
 
-    # model = sklearn.svm.SVR()
-    model = RandomForestRegressor(n_estimators=100, criterion='squared_error', random_state=42)
-    # model = None
+    model = QuantileGBR(quantiles=(0.1, 0.25, 0.5, 0.75, 0.9))
     feat = build_pipeline(data_dir=DATA_DIR, n_levels=N_LEVELS,
                           horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE, 
                           mean=True)
@@ -569,10 +730,11 @@ if __name__ == '__main__':
         _json.dump({'feat_cols': feat_cols, 'target_cols': target_cols}, _f)
     print(f'Metadata saved to {MODEL_NAME}_meta.json')
 
+    # Plot predictions on sample file
     sample_pkl = sorted(glob.glob(os.path.join(DATA_DIR, 'book-*.pkl')))[0]
     plot_predictions(
         sample_pkl, pipeline, feat_cols, target_cols,
         n_levels=N_LEVELS, horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE,
-        mean=True,
+        mean=False,
         save_path='predictions.png',
     )
