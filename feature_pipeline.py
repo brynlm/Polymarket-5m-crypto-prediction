@@ -405,6 +405,7 @@ def plot_predictions(
     n_levels: int = 5,
     horizon_ms: int = 5000,
     downsample_ms: int = 1000,
+    mean: bool = False,
     save_path: str | None = None,
 ) -> None:
     """
@@ -424,7 +425,7 @@ def plot_predictions(
     df = pd.read_pickle(pkl_path)
 
     feat = extract_features(df, n_levels=n_levels)
-    feat = filter_to_last_per_second(feat, interval_ms=downsample_ms)
+    feat = filter_to_last_per_second(feat, interval_ms=downsample_ms, mean=mean)
     feat = add_interval_features(feat, file_ts_s)
     feat = add_time_features(feat)
     feat = add_target(feat, horizon_ms=horizon_ms)
@@ -572,5 +573,6 @@ if __name__ == '__main__':
     plot_predictions(
         sample_pkl, pipeline, feat_cols, target_cols,
         n_levels=N_LEVELS, horizon_ms=HORIZON_MS, downsample_ms=DOWNSAMPLE,
+        mean=True,
         save_path='predictions.png',
     )
