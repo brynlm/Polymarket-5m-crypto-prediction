@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import sys
 import time
 import logging
 from typing import Optional
@@ -14,10 +13,6 @@ import websockets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
-# Allow imports from project root
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from feature_pipeline import add_time_features
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,30 +43,30 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Model
 # ──────────────────────────────────────────────────────────────
 
-_N_LEVELS   = 5
-_MIN_BUFFER = 30   # max_lag(9) + max_roll(20) + 1
+_N_LEVELS       = 5
+_XGB_MIN_BUFFER = 7   # max_lag(5) + 1 extra to absorb the NaN from ofi.diff(1)
 
-_pipeline: Optional[object] = None
-_feat_cols: list[str] = []
-_target_cols: list[str] = []
+_xgb_models: Optional[dict] = None   # {0.1: Pipeline, 0.5: Pipeline, 0.9: Pipeline}
+_xgb_feat_cols: list[str]   = []
+_xgb_quantiles: list[float] = []
 
 
 def _load_model() -> None:
-    global _pipeline, _feat_cols, _target_cols
-    model_path = os.path.join(_PROJ_ROOT, 'model.joblib')
-    meta_path  = os.path.join(_PROJ_ROOT, 'model_meta.json')
+    global _xgb_models, _xgb_feat_cols, _xgb_quantiles
+    model_path = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg.joblib')
+    meta_path  = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg_meta.json')
     if not os.path.exists(model_path):
-        logger.warning("model.joblib not found — predictions disabled")
+        logger.warning("xgb_quantile_reg.joblib not found — predictions disabled")
         return
     if not os.path.exists(meta_path):
-        logger.warning("model_meta.json not found — predictions disabled")
+        logger.warning("xgb_quantile_reg_meta.json not found — predictions disabled")
         return
-    _pipeline = joblib.load(model_path)
+    _xgb_models = joblib.load(model_path)
     with open(meta_path) as f:
         meta = json.load(f)
-    _feat_cols   = meta['feat_cols']
-    _target_cols = meta['target_cols']
-    logger.info(f"Model loaded: {len(_feat_cols)} features → {len(_target_cols)} targets")
+    _xgb_feat_cols = meta['feat_cols']
+    _xgb_quantiles = meta['quantiles']
+    logger.info(f"XGB model loaded: {len(_xgb_feat_cols)} features, quantiles={_xgb_quantiles}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -93,7 +88,7 @@ def _get_interval_end() -> int:
 
 
 def _compute_base_features() -> dict | None:
-    """Derive per-snapshot features from the current live order book."""
+    """Derive per-snapshot feature row for the XGB model from the current live order book."""
     book = next(iter(_curr_books.values()), None)
     if not book:
         return None
@@ -113,7 +108,7 @@ def _compute_base_features() -> dict | None:
     bid_vol_all = sum(b['size'] for b in bids)
     ask_vol_all = sum(a['size'] for a in asks)
 
-    mid      = (best_bid + best_ask) / 2
+    mid_raw  = (best_bid + best_ask) / 2
     spread   = best_ask - best_bid
     denom_t  = bid_vol + ask_vol + 1e-9
     denom_a  = bid_vol_all + ask_vol_all + 1e-9
@@ -122,36 +117,40 @@ def _compute_base_features() -> dict | None:
     ask_pxs  = sum(a['price'] * a['size'] for a in asks)
     micro    = (best_ask * bid_vol + best_bid * ask_vol) / denom_t
 
-    ts_ms    = int(time.time() * 1000)
-    i_start  = (_get_interval_end() - 300) * 1000
+    # Logit transform mid: log(1 / (1 - x)), matching the notebook's formula
+    mid_clipped = float(np.clip(mid_raw, 1e-6, 1.0 - 1e-6))
+    mid_logit   = float(np.log(1.0 / (1.0 - mid_clipped)))
 
-    btc_from_open = (
-        _btc_price - _btc_open
-        if not (np.isnan(_btc_price) or np.isnan(_btc_open))
-        else float('nan')
-    )
+    ts_s = int(time.time())
 
     row: dict = {
-        'best_bid':          best_bid,
-        'best_ask':          best_ask,
-        'bid_vol':           bid_vol,
-        'ask_vol':           ask_vol,
-        'bid_vol_all':       bid_vol_all,
-        'ask_vol_all':       ask_vol_all,
-        'bid_n_levels':      len(bids),
-        'ask_n_levels':      len(asks),
-        'mid':               mid,
-        'spread':            spread,
-        'rel_spread':        spread / (mid + 1e-9),
-        'imbalance':         (bid_vol - ask_vol) / denom_t,
-        'imbalance_all':     (bid_vol_all - ask_vol_all) / denom_a,
-        'microprice':        micro,
-        'micro_minus_mid':   micro - mid,
-        'vwap':              (bid_pxs + ask_pxs) / denom_a,
-        'btc_price':         _btc_price,
-        'btc_price_from_open': btc_from_open,
-        'time_in_interval_s': (ts_ms - i_start) / 1000.0,
-        'time_of_day_s':     (ts_ms // 1000) % 86400,
+        # Max/min cols — at ~1 Hz these equal the current snapshot value
+        'best_bid_max':    best_bid,  'best_bid_min':    best_bid,
+        'best_ask_max':    best_ask,  'best_ask_min':    best_ask,
+        'mid_max':         mid_logit, 'mid_min':         mid_logit,
+        'ask_vol_all_max': ask_vol_all, 'ask_vol_all_min': ask_vol_all,
+        'bid_vol_all_max': bid_vol_all, 'bid_vol_all_min': bid_vol_all,
+        # Base cols
+        'best_bid':        best_bid,
+        'best_ask':        best_ask,
+        'bid_vol':         bid_vol,
+        'ask_vol':         ask_vol,
+        'bid_vol_all':     bid_vol_all,
+        'ask_vol_all':     ask_vol_all,
+        'bid_n_levels':    float(len(bids)),
+        'ask_n_levels':    float(len(asks)),
+        'btc_price':       _btc_price,
+        'vwap':            (bid_pxs + ask_pxs) / denom_a,
+        'mid':             mid_logit,          # logit-transformed
+        'spread':          spread,
+        'rel_spread':      spread / (mid_raw + 1e-9),
+        'imbalance':       (bid_vol - ask_vol) / denom_t,
+        'imbalance_all':   (bid_vol_all - ask_vol_all) / denom_a,
+        'microprice':      micro,
+        'micro_minus_mid': micro - mid_raw,    # price-space difference
+        # Temporal (raw seconds, matching notebook: index % 300 / % 86400)
+        'time_in_interval':    float(ts_s % 300),
+        'time_since_midnight': float(ts_s % 86400),
     }
 
     for i in range(_N_LEVELS):
@@ -161,29 +160,60 @@ def _compute_base_features() -> dict | None:
     return row
 
 
+def _build_xgb_features(buf_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute OFI, lagged, and rolling-average features from buffer DataFrame."""
+    df = buf_df.copy()
+
+    df['ofi'] = df['bid_vol'].diff(1) - df['ask_vol'].diff(1)
+
+    LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
+                   'best_bid_max', 'best_ask_max', 'mid_max',
+                   'best_bid_min', 'best_ask_min', 'mid_min', 'ofi']
+    for lag in [1, 2, 3, 4, 5]:
+        for c in LAGGED_COLS:
+            df[f'{c}_lag{lag}'] = df[c].shift(lag)
+
+    ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask', 'rel_spread']
+    for w in [3, 4, 5]:
+        for c in ROLL_AVE_COLS:
+            df[f'{c}_ave{w}'] = df[c].rolling(w).mean()
+
+    return df
+
+
 def _try_predict() -> dict | None:
-    """Build feature vector from buffer and return predictions, or None."""
-    if _pipeline is None or not _feat_cols:
+    """Build XGB feature vector and return quantile predictions, or None."""
+    if _xgb_models is None or not _xgb_feat_cols:
         return None
-    if len(_feature_buffer) < _MIN_BUFFER:
+    if len(_feature_buffer) < _XGB_MIN_BUFFER:
         return None
 
-    buf_df   = pd.DataFrame(_feature_buffer[-_MIN_BUFFER:]).reset_index(drop=True)
-    feat_df  = add_time_features(buf_df)
-    last_row = feat_df.iloc[[-1]]
+    buf_df   = pd.DataFrame(_feature_buffer[-_XGB_MIN_BUFFER:]).reset_index(drop=True)
+    feat_df  = _build_xgb_features(buf_df)
+    last_row = feat_df.iloc[[-1]].copy()
 
-    # Fill any columns the model expects but are absent
-    for c in _feat_cols:
+    for c in _xgb_feat_cols:
         if c not in last_row.columns:
-            last_row = last_row.copy()
             last_row[c] = float('nan')
 
-    X = last_row[_feat_cols].values.astype(float)
+    X = last_row[_xgb_feat_cols].values.astype(float)
     if np.any(np.isnan(X)):
+        nan_cols = [_xgb_feat_cols[i] for i in range(len(_xgb_feat_cols)) if np.isnan(X[0, i])]
+        logger.debug(f"Skipping prediction — NaN in: {nan_cols[:5]}")
         return None
 
-    preds = _pipeline.predict(X)[0]   # (n_targets,)
-    return {tc: float(p) for tc, p in zip(_target_cols, preds)}
+    # Current mid in price space (inverse of notebook logit: x = 1 - exp(-logit))
+    mid_logit = float(last_row['mid'].values[0])
+    mid_raw   = 1.0 - float(np.exp(-mid_logit))
+
+    result: dict = {'mid': mid_raw}
+    for q, pipe in _xgb_models.items():
+        return_pred = float(pipe.predict(X)[0])
+        pred_logit  = mid_logit + return_pred
+        pred_price  = float(np.clip(1.0 - np.exp(-pred_logit), 0.0, 1.0))
+        result[f'q{int(q * 100)}'] = pred_price  # e.g. 'q10', 'q50', 'q90'
+
+    return result
 
 
 # ──────────────────────────────────────────────────────────────
@@ -299,8 +329,8 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                     continue
 
                 _feature_buffer.append(row)
-                if len(_feature_buffer) > _MIN_BUFFER * 2:
-                    _feature_buffer = _feature_buffer[-_MIN_BUFFER * 2:]
+                if len(_feature_buffer) > _XGB_MIN_BUFFER * 4:
+                    _feature_buffer = _feature_buffer[-_XGB_MIN_BUFFER * 4:]
 
                 preds = _try_predict()
                 if preds:
@@ -320,12 +350,6 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
 # ──────────────────────────────────────────────────────────────
 # App lifecycle
 # ──────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup() -> None:
-    _load_model()
-    asyncio.create_task(poll_btc_price())
-
 
 # ──────────────────────────────────────────────────────────────
 # REST endpoints

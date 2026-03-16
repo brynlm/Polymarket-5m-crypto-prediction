@@ -29,11 +29,13 @@ export function PriceChart({ data, latestPredictions }: Props) {
   }
 
   const formatted = data.map(p => ({
-    time:    formatTime(p.time),
-    Mid:     +p.midPrice.toFixed(4),
-    Bid:     +p.bestBid.toFixed(4),
-    Ask:     +p.bestAsk.toFixed(4),
-    'Pred (5s)': p.predMid != null ? +p.predMid.toFixed(4) : null,
+    time:      formatTime(p.time),
+    Mid:       +p.midPrice.toFixed(4),
+    Bid:       +p.bestBid.toFixed(4),
+    Ask:       +p.bestAsk.toFixed(4),
+    'Q50 (5s)': p.predQ50 != null ? +p.predQ50.toFixed(4) : null,
+    'Q10':      p.predQ10 != null ? +p.predQ10.toFixed(4) : null,
+    'Q90':      p.predQ90 != null ? +p.predQ90.toFixed(4) : null,
   }))
 
   const allPrices = data.flatMap(p => [p.bestBid, p.bestAsk])
@@ -42,7 +44,8 @@ export function PriceChart({ data, latestPredictions }: Props) {
   const pad = (max - min) * 0.15 || 0.02
   const domain: [number, number] = [+(min - pad).toFixed(4), +(max + pad).toFixed(4)]
 
-  const hasPreds = latestPredictions != null
+  const hasPreds = latestPredictions != null &&
+    (latestPredictions['q10'] != null || latestPredictions['q50'] != null)
 
   return (
     <div>
@@ -65,21 +68,25 @@ export function PriceChart({ data, latestPredictions }: Props) {
             itemStyle={{ fontSize: 12 }}
           />
           <Legend iconType="plainline" />
-          <Line type="monotone" dataKey="Mid"        stroke="#60a5fa" dot={false} strokeWidth={2} />
-          <Line type="monotone" dataKey="Bid"        stroke="#34d399" dot={false} strokeWidth={1} strokeDasharray="5 3" />
-          <Line type="monotone" dataKey="Ask"        stroke="#f87171" dot={false} strokeWidth={1} strokeDasharray="5 3" />
-          <Line type="monotone" dataKey="Pred (5s)"  stroke="#f59e0b" dot={false} strokeWidth={1.5} strokeDasharray="4 2" connectNulls={false} />
+          <Line type="monotone" dataKey="Mid"       stroke="#60a5fa" dot={false} strokeWidth={2} />
+          <Line type="monotone" dataKey="Bid"       stroke="#34d399" dot={false} strokeWidth={1} strokeDasharray="5 3" />
+          <Line type="monotone" dataKey="Ask"       stroke="#f87171" dot={false} strokeWidth={1} strokeDasharray="5 3" />
+          <Line type="monotone" dataKey="Q50 (5s)"  stroke="#f59e0b" dot={false} strokeWidth={1.5} strokeDasharray="4 2" connectNulls={false} />
+          <Line type="monotone" dataKey="Q10"       stroke="#a78bfa" dot={false} strokeWidth={1} strokeDasharray="2 3" connectNulls={false} />
+          <Line type="monotone" dataKey="Q90"       stroke="#fb923c" dot={false} strokeWidth={1} strokeDasharray="2 3" connectNulls={false} />
         </LineChart>
       </ResponsiveContainer>
 
       {hasPreds && (
-        <div className="mt-3 grid grid-cols-5 gap-2">
-          {[1, 2, 3, 4, 5].map(k => {
-            const val = latestPredictions![`target_${k}s`]
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          {(['q10', 'q50', 'q90'] as const).map((key, i) => {
+            const labels = ['10th %ile', 'Median', '90th %ile']
+            const colors = ['text-violet-400', 'text-amber-400', 'text-orange-400']
+            const val = latestPredictions![key]
             return (
-              <div key={k} className="bg-gray-800 rounded px-2 py-1.5 text-center">
-                <div className="text-xs text-gray-500 mb-0.5">+{k}s</div>
-                <div className="text-sm font-mono text-amber-400">
+              <div key={key} className="bg-gray-800 rounded px-2 py-1.5 text-center">
+                <div className="text-xs text-gray-500 mb-0.5">{labels[i]} +5s</div>
+                <div className={`text-sm font-mono ${colors[i]}`}>
                   {val != null ? val.toFixed(4) : '—'}
                 </div>
               </div>

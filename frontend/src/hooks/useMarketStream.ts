@@ -149,7 +149,12 @@ export function useMarketStream(slug: string | null) {
               p => Math.abs(p.time - targetTime) < 1500
             )
             const enriched: PricePoint = match
-              ? { ...point, predMid: match.predictions['target_5s'] }
+              ? {
+                  ...point,
+                  predQ10: match.predictions['q10'],
+                  predQ50: match.predictions['q50'],
+                  predQ90: match.predictions['q90'],
+                }
               : point
             newPriceHistory = [...prev.priceHistory, enriched].slice(-MAX_PRICE_HISTORY)
           }

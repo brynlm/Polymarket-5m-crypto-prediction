@@ -15,7 +15,9 @@ export interface PricePoint {
   midPrice: number
   bestBid: number
   bestAsk: number
-  predMid?: number   // model's target_5s prediction made ~5 s ago
+  predQ10?: number   // XGB 10th-percentile predicted mid (~5 s ahead)
+  predQ50?: number   // XGB median predicted mid
+  predQ90?: number   // XGB 90th-percentile predicted mid
 }
 
 export interface PredictionPoint {
