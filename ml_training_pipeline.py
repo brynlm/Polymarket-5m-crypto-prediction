@@ -23,10 +23,10 @@ LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
 LAGS = [1,2,3,4,5]
 ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask',
                 'rel_spread', 'btc_price', 'btc_price_from_open']
-ROLL_WINDOWS = [3,4,5]
+ROLL_WINDOWS = [3,4,5,10]
 
 # Prediction window
-PRED_WINDOW = 5
+PRED_WINDOW = 10
 
 
 def load_raw_books(data_dir='raw_book_data') -> pd.DataFrame:
@@ -166,14 +166,17 @@ def transform_features(downsamp_feat):
 
 
 if __name__ == "__main__":
+    MODEL_NAME = 'xgb_qreg_10s'
     READ_FROM_PKL = True
     TARGET_COLS = ['return']
     QUANTILES = [0.1, 0.5, 0.9]
 
     models = {q: Pipeline([('scaler', MinMaxScaler()), 
                            ('model', XGBRegressor(
-                               objective='reg:quantileerror', quantile_alpha=q, 
-                               n_estimators=100, random_state=42))]) 
+                               objective='reg:quantileerror', 
+                               quantile_alpha=q, 
+                               n_estimators=200, 
+                               random_state=42))]) 
                 for q in QUANTILES}
     
     if READ_FROM_PKL:
@@ -229,7 +232,7 @@ if __name__ == "__main__":
     print(f"Directional accuracy of median: {directional_acc}")
     
     # Save model:
-    joblib.dump(models, 'xgb_quantile_reg.joblib')
+    joblib.dump(models, MODEL_NAME + '.joblib')
 
     # Save metadata (feature config + ordered column list for inference)
     feat_cols = clean.drop(columns=TARGET_COLS).columns.tolist()
@@ -246,6 +249,6 @@ if __name__ == "__main__":
         'roll_ave_cols': ROLL_AVE_COLS,
         'roll_windows':  ROLL_WINDOWS,
     }
-    with open('xgb_quantile_reg_meta.json', 'w') as f:
+    with open(f'{MODEL_NAME}_meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
-    print(f"Saved model ({len(feat_cols)} features) → xgb_quantile_reg.joblib + xgb_quantile_reg_meta.json")
+    print(f"Saved model ({len(feat_cols)} features) → {MODEL_NAME}.joblib + {MODEL_NAME}_meta.json")

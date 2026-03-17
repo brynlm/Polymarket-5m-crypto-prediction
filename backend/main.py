@@ -44,6 +44,8 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Model
 # ──────────────────────────────────────────────────────────────
 
+MODEL_NAME = 'xgb_qreg_10s'
+
 _xgb_models: Optional[dict] = None   # {0.1: Pipeline, 0.5: Pipeline, 0.9: Pipeline}
 _xgb_feat_cols:   list[str]   = []
 _xgb_quantiles:   list[float] = []
@@ -68,8 +70,8 @@ def _load_model() -> None:
     global _n_levels, _max_min_cols, _lagged_cols, _lags
     global _roll_ave_cols, _roll_windows, _pred_window, _XGB_MIN_BUFFER
 
-    model_path = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg.joblib')
-    meta_path  = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg_meta.json')
+    model_path = os.path.join(_PROJ_ROOT, f'{MODEL_NAME}.joblib')
+    meta_path  = os.path.join(_PROJ_ROOT, f'{MODEL_NAME}_meta.json')
     if not os.path.exists(model_path):
         logger.warning("xgb_quantile_reg.joblib not found — predictions disabled")
         return
@@ -90,7 +92,9 @@ def _load_model() -> None:
     _roll_ave_cols  = meta.get('roll_ave_cols',  _roll_ave_cols)
     _roll_windows   = meta.get('roll_windows',   _roll_windows)
     _pred_window    = meta.get('pred_window',    _pred_window)
-    _XGB_MIN_BUFFER = (max(_lags) + 2) if _lags else 7
+    min_for_lags  = (max(_lags) + 2) if _lags else 7
+    min_for_rolls = max(_roll_windows) if _roll_windows else 1
+    _XGB_MIN_BUFFER = max(min_for_lags, min_for_rolls)
 
     logger.info(
         f"XGB model loaded: {len(_xgb_feat_cols)} features, quantiles={_xgb_quantiles}, "
