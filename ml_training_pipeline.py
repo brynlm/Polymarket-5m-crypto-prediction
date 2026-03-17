@@ -11,12 +11,12 @@ from xgboost import XGBRegressor
 
 # Downsample columns to 1s
 MAX_MIN_COLS = ['best_bid', 'best_ask', 'mid', 'ask_vol_all', 'bid_vol_all']
-AVE_COLS = []
+AVE_COLS = ['spread', 'rel_spread']
 
 # Order book depth
 N_LEVELS = 5
 
-# Add time-lagged + rolling average features
+# Add time-lagged + rolling average features and diff features
 LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
                'best_bid_max', 'best_ask_max', 'mid_max',
                'best_bid_min', 'best_ask_min', 'mid_min', 'ofi']
@@ -126,13 +126,16 @@ def _logit(x):
     logits = np.log(1 / (1-x_clipped))
     return logits
 
-def downsample_features_1s(feat, max_min_cols):
+def downsample_features_1s(feat, max_min_cols, ave_cols):
     # Downsample 1s intervals
     filter_1s = feat.index // 1000
     downsamp_feat = feat.groupby(filter_1s).last()  # Get last point in each interval for (all features)
     downsamp_maxmin = feat.groupby(filter_1s)[max_min_cols].agg(['max', 'min']) # Get max and min in each interval
     downsamp_maxmin.columns = ['_'.join(col) for col in downsamp_maxmin.columns.values]
-    downsamp_feat = pd.concat([downsamp_maxmin, downsamp_feat], axis=1)
+    downsamp_ave = (feat.groupby(filter_1s)[ave_cols] # Get average over each interval
+                    .mean()
+                    .rename(columns=lambda x: x+'_ave'))
+    downsamp_feat = pd.concat([downsamp_feat, downsamp_maxmin, downsamp_ave], axis=1)
     return downsamp_feat
 
 
@@ -187,7 +190,7 @@ if __name__ == "__main__":
         feat.to_pickle('raw_extracted_features.pkl') # Save to pkl for later
 
     feat['mid'] = _logit(feat['mid']) # Transform mid price to logit space
-    downsamp_feat = downsample_features_1s(feat, MAX_MIN_COLS) # Downsample to 1s intervals
+    downsamp_feat = downsample_features_1s(feat, MAX_MIN_COLS, AVE_COLS) # Downsample to 1s intervals
     downsamp_feat = transform_features(downsamp_feat) # Apply feature transformations
 
     clean = downsamp_feat.dropna()
@@ -244,6 +247,7 @@ if __name__ == "__main__":
         'pred_window':   PRED_WINDOW,
         'n_levels':      N_LEVELS,
         'max_min_cols':  MAX_MIN_COLS,
+        'ave_cols':      AVE_COLS,
         'lagged_cols':   LAGGED_COLS,
         'lags':          LAGS,
         'roll_ave_cols': ROLL_AVE_COLS,
