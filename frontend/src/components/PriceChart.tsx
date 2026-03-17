@@ -8,11 +8,33 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts'
-import type { PricePoint } from '../types'
+import type { PricePoint, PredictionPoint } from '../types'
 
 interface Props {
   data: PricePoint[]
+  predictionHistory: PredictionPoint[]
   latestPredictions: Record<string, number> | null
+}
+
+/** Binary-search predictionHistory for the entry nearest to `time`, within maxDeltaMs. */
+function findNearestPreds(
+  preds: PredictionPoint[],
+  time: number,
+  maxDeltaMs = 5000,
+): Record<string, number> | null {
+  if (preds.length === 0) return null
+  let lo = 0, hi = preds.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (preds[mid].time < time) lo = mid + 1
+    else hi = mid
+  }
+  const candidates: PredictionPoint[] = [preds[lo]]
+  if (lo > 0) candidates.push(preds[lo - 1])
+  const best = candidates.reduce((a, b) =>
+    Math.abs(a.time - time) < Math.abs(b.time - time) ? a : b
+  )
+  return Math.abs(best.time - time) <= maxDeltaMs ? best.predictions : null
 }
 
 const PRED_HORIZON_MS = 5000
@@ -42,12 +64,20 @@ const DEFAULT_VISIBLE: Record<SeriesKey, boolean> = {
   'Mid': true, 'Bid': true, 'Ask': true, 'Q50 (5s)': true, 'Q10': true, 'Q90': true,
 }
 
+const WINDOW_PRESETS = [15, 30, 60, 300] as const
+const DEFAULT_WINDOW_SECS = 30
+
 function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-export function PriceChart({ data, latestPredictions }: Props) {
+function formatWindowLabel(secs: number) {
+  return secs >= 60 ? `${secs / 60}m` : `${secs}s`
+}
+
+export function PriceChart({ data, predictionHistory, latestPredictions }: Props) {
   const [visible, setVisible] = useState<Record<SeriesKey, boolean>>(DEFAULT_VISIBLE)
+  const [windowSecs, setWindowSecs] = useState(DEFAULT_WINDOW_SECS)
 
   const toggleSeries = (key: SeriesKey) =>
     setVisible(v => ({ ...v, [key]: !v[key] }))
@@ -60,34 +90,30 @@ export function PriceChart({ data, latestPredictions }: Props) {
     )
   }
 
-  const lastPoint = data[data.length - 1]
-  const hasPreds  = latestPredictions != null && latestPredictions['q50'] != null
+  const lastPoint  = data[data.length - 1]
+  const cutoff     = lastPoint.time - windowSecs * 1000
+  const windowData = data.filter(p => p.time >= cutoff)
+  const hasPreds   = latestPredictions != null && latestPredictions['q50'] != null
 
-  // Historical points: Mid/Bid/Ask only, Q lines are null
-  const formatted: ChartPoint[] = data.map(p => ({
-    time:       formatTime(p.time),
-    Mid:        +p.midPrice.toFixed(4),
-    Bid:        +p.bestBid.toFixed(4),
-    Ask:        +p.bestAsk.toFixed(4),
-    'Q50 (5s)': null,
-    Q10:        null,
-    Q90:        null,
-  }))
+  // Map each price point to its nearest prediction from history
+  const formatted: ChartPoint[] = windowData.map(p => {
+    const preds = findNearestPreds(predictionHistory, p.time)
+    return {
+      time:       formatTime(p.time),
+      Mid:        +p.midPrice.toFixed(4),
+      Bid:        +p.bestBid.toFixed(4),
+      Ask:        +p.bestAsk.toFixed(4),
+      'Q50 (5s)': preds?.['q50'] != null ? +preds['q50'].toFixed(4) : null,
+      Q10:        preds?.['q10'] != null ? +preds['q10'].toFixed(4) : null,
+      Q90:        preds?.['q90'] != null ? +preds['q90'].toFixed(4) : null,
+    }
+  })
 
+  // Project the latest predictions forward to T+5s
   if (hasPreds) {
     const q10 = +latestPredictions!['q10'].toFixed(4)
     const q50 = +latestPredictions!['q50'].toFixed(4)
     const q90 = +latestPredictions!['q90'].toFixed(4)
-
-    // Anchor the Q lines at the last real data point so they start at "now"
-    formatted[formatted.length - 1] = {
-      ...formatted[formatted.length - 1],
-      'Q50 (5s)': q50,
-      Q10:        q10,
-      Q90:        q90,
-    }
-
-    // Project forward to T+5s — this point has no real price data
     formatted.push({
       time:       formatTime(lastPoint.time + PRED_HORIZON_MS),
       Mid:        null,
@@ -100,7 +126,7 @@ export function PriceChart({ data, latestPredictions }: Props) {
   }
 
   // Domain: include Q values so the future points are always in view
-  const allPrices = data.flatMap(p => [p.bestBid, p.bestAsk])
+  const allPrices = windowData.flatMap(p => [p.bestBid, p.bestAsk])
   if (hasPreds) {
     allPrices.push(latestPredictions!['q10'], latestPredictions!['q90'])
   }
@@ -111,22 +137,39 @@ export function PriceChart({ data, latestPredictions }: Props) {
 
   return (
     <div>
-      {/* Custom toggle legend */}
-      <div className="flex flex-wrap gap-1.5 mb-3">
-        {SERIES.map(({ key, color }) => {
-          const on = visible[key]
-          return (
+      {/* Toolbar: series toggles + window selector */}
+      <div className="flex flex-wrap items-center justify-between gap-1.5 mb-3">
+        <div className="flex flex-wrap gap-1.5">
+          {SERIES.map(({ key, color }) => {
+            const on = visible[key]
+            return (
+              <button
+                key={key}
+                onClick={() => toggleSeries(key)}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-xs transition-opacity"
+                style={{ opacity: on ? 1 : 0.35 }}
+              >
+                <span className="w-5 h-0.5 inline-block rounded" style={{ backgroundColor: color }} />
+                <span style={{ color: on ? color : '#6b7280' }}>{key}</span>
+              </button>
+            )
+          })}
+        </div>
+        <div className="flex gap-1">
+          {WINDOW_PRESETS.map(secs => (
             <button
-              key={key}
-              onClick={() => toggleSeries(key)}
-              className="flex items-center gap-1 px-2 py-0.5 rounded text-xs transition-opacity"
-              style={{ opacity: on ? 1 : 0.35 }}
+              key={secs}
+              onClick={() => setWindowSecs(secs)}
+              className={`px-2 py-0.5 rounded text-xs transition-colors ${
+                windowSecs === secs
+                  ? 'bg-gray-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+              }`}
             >
-              <span className="w-5 h-0.5 inline-block rounded" style={{ backgroundColor: color }} />
-              <span style={{ color: on ? color : '#6b7280' }}>{key}</span>
+              {formatWindowLabel(secs)}
             </button>
-          )
-        })}
+          ))}
+        </div>
       </div>
 
       <ResponsiveContainer width="100%" height={260}>

@@ -128,7 +128,7 @@ export default function App() {
             <h2 className="text-sm font-medium text-gray-300">Price History</h2>
             <span className="text-xs text-gray-600">{market.priceHistory.length} points</span>
           </div>
-          <PriceChart data={market.priceHistory} latestPredictions={market.latestPredictions} />
+          <PriceChart data={market.priceHistory} predictionHistory={market.predictionHistory} latestPredictions={market.latestPredictions} />
         </div>
 
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
