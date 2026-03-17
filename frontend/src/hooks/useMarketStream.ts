@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { MarketState, OrderBook, PricePoint, PredictionPoint, MarketEvent, OrderBookEntry } from '../types'
+import type { MarketState, OrderBook, PricePoint, PredictionPoint, OrderBookEntry } from '../types'
 
 const WS_URL            = 'ws://localhost:8000/ws'
 const MAX_PRICE_HISTORY = 300
 const MAX_PRED_HISTORY  = 300
-const MAX_EVENTS        = 100
 const FLUSH_INTERVAL_MS = 1000   // flush refs → React state at 1 Hz
 
 function getMidPrice(books: Record<string, OrderBook>): PricePoint | null {
@@ -23,21 +22,19 @@ function parseEntries(raw: { price: string; size: string }[], descending: boolea
 
 const INITIAL_STATE: MarketState = {
   orderBooks: {}, priceHistory: [], predictionHistory: [],
-  latestPredictions: null, events: [], status: 'disconnected',
+  latestPredictions: null, status: 'disconnected',
 }
 
 export function useMarketStream(slug: string | null) {
   const [state, setState] = useState<MarketState>(INITIAL_STATE)
 
-  const wsRef         = useRef<WebSocket | null>(null)
-  const eventIdRef    = useRef(0)
+  const wsRef = useRef<WebSocket | null>(null)
 
   // All mutable data lives in refs — onmessage writes here, interval flushes to React state
   const booksRef       = useRef<Record<string, OrderBook>>({})
   const priceHistRef   = useRef<PricePoint[]>([])
   const predHistRef    = useRef<PredictionPoint[]>([])
   const latestPredsRef = useRef<Record<string, number> | null>(null)
-  const eventsRef      = useRef<MarketEvent[]>([])
   const statusRef      = useRef<MarketState['status']>('disconnected')
 
   // 1-second flush: copy refs into React state (the only setState call in the hot path)
@@ -48,7 +45,6 @@ export function useMarketStream(slug: string | null) {
         priceHistory:      priceHistRef.current,
         predictionHistory: predHistRef.current,
         latestPredictions: latestPredsRef.current,
-        events:            eventsRef.current,
         status:            statusRef.current,
       })
     }, FLUSH_INTERVAL_MS)
@@ -63,7 +59,6 @@ export function useMarketStream(slug: string | null) {
     priceHistRef.current   = []
     predHistRef.current    = []
     latestPredsRef.current = null
-    eventsRef.current      = []
     statusRef.current      = 'connecting'
     setState({ ...INITIAL_STATE, status: 'connecting' })
 
@@ -93,11 +88,6 @@ export function useMarketStream(slug: string | null) {
           latestPredsRef.current = predPoint.predictions
           continue
         }
-
-        eventsRef.current = [
-          { id: ++eventIdRef.current, event_type: eventType, asset_id: assetId, raw: msg, timestamp: Date.now() },
-          ...eventsRef.current,
-        ].slice(0, MAX_EVENTS)
 
         let priceUpdated = false
 

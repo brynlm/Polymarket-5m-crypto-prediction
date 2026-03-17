@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react'
 import { useMarketStream } from './hooks/useMarketStream'
 import { PriceChart } from './components/PriceChart'
 import { OrderBook } from './components/OrderBook'
-import { EventFeed } from './components/EventFeed'
 
 const API_URL = 'http://localhost:8000'
 
@@ -136,13 +135,6 @@ export default function App() {
           <OrderBook books={market.orderBooks} />
         </div>
 
-        <div className="col-span-3 bg-gray-900 rounded-lg p-4 border border-gray-800">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-medium text-gray-300">Event Feed</h2>
-            <span className="text-xs text-gray-600">{market.events.length} events</span>
-          </div>
-          <EventFeed events={market.events} />
-        </div>
       </div>
     </div>
   )

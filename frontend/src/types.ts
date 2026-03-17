@@ -22,20 +22,11 @@ export interface PredictionPoint {
   predictions: Record<string, number>
 }
 
-export interface MarketEvent {
-  id: number
-  event_type: string
-  asset_id?: string
-  raw: unknown
-  timestamp: number
-}
-
 export interface MarketState {
   orderBooks: Record<string, OrderBook>
   priceHistory: PricePoint[]
   predictionHistory: PredictionPoint[]
   latestPredictions: Record<string, number> | null
-  events: MarketEvent[]
   status: 'disconnected' | 'connecting' | 'connected' | 'error'
   error?: string
 }
