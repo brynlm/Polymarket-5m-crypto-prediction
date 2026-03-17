@@ -36,7 +36,8 @@ app.add_middleware(
 
 POLYMARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_API = "https://gamma-api.polymarket.com"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_TICKER_URL  = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_KLINES_URL  = "https://api.binance.com/api/v3/klines"
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ──────────────────────────────────────────────────────────────
@@ -244,6 +245,20 @@ def _try_predict() -> dict | None:
 # Background tasks
 # ──────────────────────────────────────────────────────────────
 
+def _fetch_btc_interval_open() -> float:
+    """Return the open price of the current 5-minute BTC/USDT candle from Binance klines."""
+    try:
+        resp = requests.get(
+            BINANCE_KLINES_URL,
+            params={"symbol": "BTCUSDT", "interval": "5m", "limit": 1},
+            timeout=3,
+        )
+        return float(resp.json()[0][1])   # [0] = latest candle, [1] = open price
+    except Exception as e:
+        logger.warning(f"BTC interval open fetch failed: {e}")
+        return float('nan')
+
+
 async def poll_btc_price() -> None:
     global _btc_price, _btc_open
     while True:
@@ -252,7 +267,8 @@ async def poll_btc_price() -> None:
             price = float(resp.json()['price'])
             _btc_price = price
             if np.isnan(_btc_open):
-                _btc_open = price
+                # Fetch the actual candle open so btc_price_from_open matches training
+                _btc_open = _fetch_btc_interval_open()
         except Exception as e:
             logger.warning(f"BTC price poll failed: {e}")
         await asyncio.sleep(2)
@@ -345,7 +361,7 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                 interval_end = _get_interval_end()
                 if interval_end != _interval_end:
                     _interval_end = interval_end
-                    _btc_open = _btc_price
+                    _btc_open = _fetch_btc_interval_open()
                     _feature_buffer.clear()
 
                 row = _compute_base_features()
