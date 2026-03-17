@@ -53,6 +53,7 @@ _xgb_quantiles:   list[float] = []
 # Feature-engineering config — populated from metadata at load time
 _n_levels:      int        = 5
 _max_min_cols:  list[str]  = []
+_ave_cols:      list[str]  = []
 _lagged_cols:   list[str]  = []
 _lags:          list[int]  = []
 _roll_ave_cols: list[str]  = []
@@ -67,7 +68,7 @@ _XGB_MIN_BUFFER: int = 7   # updated dynamically in _load_model()
 
 def _load_model() -> None:
     global _xgb_models, _xgb_feat_cols, _xgb_quantiles
-    global _n_levels, _max_min_cols, _lagged_cols, _lags
+    global _n_levels, _max_min_cols, _ave_cols, _lagged_cols, _lags
     global _roll_ave_cols, _roll_windows, _pred_window, _XGB_MIN_BUFFER
 
     model_path = os.path.join(_PROJ_ROOT, f'{MODEL_NAME}.joblib')
@@ -87,6 +88,7 @@ def _load_model() -> None:
     _xgb_quantiles  = meta['quantiles']
     _n_levels       = meta.get('n_levels',      _n_levels)
     _max_min_cols   = meta.get('max_min_cols',   _max_min_cols)
+    _ave_cols       = meta.get('ave_cols',       _ave_cols)
     _lagged_cols    = meta.get('lagged_cols',    _lagged_cols)
     _lags           = meta.get('lags',           _lags)
     _roll_ave_cols  = meta.get('roll_ave_cols',  _roll_ave_cols)
@@ -109,11 +111,12 @@ def _load_model() -> None:
 # {asset_id: {'bids': [{'price': float, 'size': float}, ...], 'asks': [...]}}
 _curr_books: dict[str, dict] = {}
 _feature_buffer: list[dict]  = []
+_tick_buffer:    list[dict]  = []   # sub-second raw snapshots, aggregated each second
+_current_second: int         = 0    # last second boundary that was aggregated
 
 _btc_price:    float = float('nan')
 _btc_open:     float = float('nan')
 _interval_end: int   = 0          # Unix-second timestamp of current interval end
-_last_pred_ts: float = 0.0
 
 
 def _get_interval_end() -> int:
@@ -184,11 +187,25 @@ def _compute_base_features() -> dict | None:
         row[f'bid_size_L{i+1}'] = top_bids[i]['size'] if i < len(top_bids) else 0.0
         row[f'ask_size_L{i+1}'] = top_asks[i]['size'] if i < len(top_asks) else 0.0
 
-    # Max/min cols driven by metadata (at ~1 Hz these equal the current snapshot value)
-    for col in _max_min_cols:
-        row[f'{col}_max'] = row[col]
-        row[f'{col}_min'] = row[col]
+    return row
 
+
+def _aggregate_1s_row(ticks: list[dict]) -> dict:
+    """Aggregate sub-second tick dicts into a 1-second bar, matching downsample_features_1s:
+    - base columns: last tick value (.last())
+    - max_min_cols: per-second max → {col}_max, min → {col}_min
+    - ave_cols:     per-second mean → {col}_ave
+    """
+    row = dict(ticks[-1])  # last tick as base (matches groupby.last())
+    for col in _max_min_cols:
+        vals = [t[col] for t in ticks if col in t]
+        if vals:
+            row[f'{col}_max'] = max(vals)
+            row[f'{col}_min'] = min(vals)
+    for col in _ave_cols:
+        vals = [t[col] for t in ticks if col in t]
+        if vals:
+            row[f'{col}_ave'] = sum(vals) / len(vals)
     return row
 
 
@@ -327,9 +344,10 @@ def _apply_book_update(asset_id: str, msg: dict) -> None:
 
 
 async def run_polymarket_stream(token_ids: list[str]) -> None:
-    global _curr_books, _feature_buffer, _last_pred_ts, _btc_open, _interval_end
+    global _curr_books, _feature_buffer, _tick_buffer, _current_second, _btc_open, _interval_end
     _curr_books.clear()
     _feature_buffer.clear()
+    _tick_buffer.clear()
 
     logger.info(f"Starting Polymarket stream for {len(token_ids)} tokens")
     try:
@@ -355,11 +373,21 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                     if asset_id:
                         _apply_book_update(asset_id, m)
 
-                # Throttle predictions to ~1 Hz
                 now = time.time()
-                if now - _last_pred_ts < 1.0 or not _curr_books:
+                if not _curr_books:
                     continue
-                _last_pred_ts = now
+
+                # Accumulate every sub-second tick
+                tick = _compute_base_features()
+                if tick is None:
+                    continue
+                _tick_buffer.append(tick)
+
+                # At each new second boundary: aggregate ticks → 1s row
+                this_second = int(now)
+                if this_second <= _current_second:
+                    continue
+                _current_second = this_second
 
                 # Reset buffer on interval rollover
                 interval_end = _get_interval_end()
@@ -368,11 +396,10 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                     _btc_open = _fetch_btc_interval_open()
                     _feature_buffer.clear()
 
-                row = _compute_base_features()
-                if row is None:
-                    continue
+                row_1s = _aggregate_1s_row(_tick_buffer)
+                _tick_buffer.clear()
 
-                _feature_buffer.append(row)
+                _feature_buffer.append(row_1s)
                 if len(_feature_buffer) > _XGB_MIN_BUFFER * 4:
                     _feature_buffer = _feature_buffer[-_XGB_MIN_BUFFER * 4:]
 
