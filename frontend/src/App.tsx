@@ -3,7 +3,12 @@ import { useMarketStream } from './hooks/useMarketStream'
 import { PriceChart } from './components/PriceChart'
 import { OrderBook } from './components/OrderBook'
 
-const API_URL = 'http://localhost:8000'
+const API_URL       = 'http://localhost:8000'
+const INTERVAL_MS   = 5 * 60 * 1000   // 5-minute market interval
+
+function msUntilNextInterval() {
+  return INTERVAL_MS - (Date.now() % INTERVAL_MS)
+}
 
 interface ActiveMarket {
   slug: string
@@ -25,18 +30,34 @@ export default function App() {
 
   const market = useMarketStream(selectedSlug)
 
-  useEffect(() => {
+  function fetchMarkets(forceSwitch: boolean) {
     fetch(`${API_URL}/api/markets/active`)
       .then(r => r.json())
       .then((data: ActiveMarket[]) => {
         setActiveMarkets(data)
-        if (data.length > 0 && !selectedSlug) {
-          setSelectedSlug(data[0].slug)
+        if (data.length > 0) {
+          if (forceSwitch) setSelectedSlug(data[0].slug)
+          else setSelectedSlug(s => s ?? data[0].slug)
         }
       })
       .catch(console.error)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }
+
+  // Initial load
+  useEffect(() => { fetchMarkets(false) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-switch at each 5-minute interval boundary
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>
+    function scheduleNext() {
+      timerId = setTimeout(() => {
+        fetchMarkets(true)
+        scheduleNext()
+      }, msUntilNextInterval())
+    }
+    scheduleNext()
+    return () => clearTimeout(timerId)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleCustomSlug() {
     const slug = customSlug.trim()
