@@ -13,12 +13,15 @@ from xgboost import XGBRegressor
 MAX_MIN_COLS = ['best_bid', 'best_ask', 'mid', 'ask_vol_all', 'bid_vol_all']
 AVE_COLS = []
 
+# Order book depth
+N_LEVELS = 5
+
 # Add time-lagged + rolling average features
-LAGGED_COLS = ['best_bid', 'best_ask', 'mid', 
-               'best_bid_max', 'best_ask_max', 'mid_max', 
+LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
+               'best_bid_max', 'best_ask_max', 'mid_max',
                'best_bid_min', 'best_ask_min', 'mid_min', 'ofi']
 LAGS = [1,2,3,4,5]
-ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask', 
+ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask',
                 'rel_spread', 'btc_price', 'btc_price_from_open']
 ROLL_WINDOWS = [3,4,5]
 
@@ -227,3 +230,22 @@ if __name__ == "__main__":
     
     # Save model:
     joblib.dump(models, 'xgb_quantile_reg.joblib')
+
+    # Save metadata (feature config + ordered column list for inference)
+    feat_cols = clean.drop(columns=TARGET_COLS).columns.tolist()
+    meta = {
+        'feat_cols':     feat_cols,
+        'quantiles':     QUANTILES,
+        'target':        TARGET_COLS[0],
+        'n_features':    len(feat_cols),
+        'pred_window':   PRED_WINDOW,
+        'n_levels':      N_LEVELS,
+        'max_min_cols':  MAX_MIN_COLS,
+        'lagged_cols':   LAGGED_COLS,
+        'lags':          LAGS,
+        'roll_ave_cols': ROLL_AVE_COLS,
+        'roll_windows':  ROLL_WINDOWS,
+    }
+    with open('xgb_quantile_reg_meta.json', 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"Saved model ({len(feat_cols)} features) → xgb_quantile_reg.joblib + xgb_quantile_reg_meta.json")

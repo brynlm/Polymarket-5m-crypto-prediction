@@ -15,9 +15,6 @@ export interface PricePoint {
   midPrice: number
   bestBid: number
   bestAsk: number
-  predQ10?: number   // XGB 10th-percentile predicted mid (~5 s ahead)
-  predQ50?: number   // XGB median predicted mid
-  predQ90?: number   // XGB 90th-percentile predicted mid
 }
 
 export interface PredictionPoint {

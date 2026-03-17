@@ -15,6 +15,8 @@ interface Props {
   latestPredictions: Record<string, number> | null
 }
 
+const PRED_HORIZON_MS = 5000
+
 const SERIES = [
   { key: 'Mid',      color: '#60a5fa', width: 2,   dash: undefined },
   { key: 'Bid',      color: '#34d399', width: 1,   dash: '5 3' },
@@ -25,6 +27,16 @@ const SERIES = [
 ] as const
 
 type SeriesKey = typeof SERIES[number]['key']
+
+type ChartPoint = {
+  time: string
+  Mid:        number | null
+  Bid:        number | null
+  Ask:        number | null
+  'Q50 (5s)': number | null
+  Q10:        number | null
+  Q90:        number | null
+}
 
 const DEFAULT_VISIBLE: Record<SeriesKey, boolean> = {
   'Mid': true, 'Bid': true, 'Ask': true, 'Q50 (5s)': true, 'Q10': true, 'Q90': true,
@@ -48,24 +60,54 @@ export function PriceChart({ data, latestPredictions }: Props) {
     )
   }
 
-  const formatted = data.map(p => ({
+  const lastPoint = data[data.length - 1]
+  const hasPreds  = latestPredictions != null && latestPredictions['q50'] != null
+
+  // Historical points: Mid/Bid/Ask only, Q lines are null
+  const formatted: ChartPoint[] = data.map(p => ({
     time:       formatTime(p.time),
     Mid:        +p.midPrice.toFixed(4),
     Bid:        +p.bestBid.toFixed(4),
     Ask:        +p.bestAsk.toFixed(4),
-    'Q50 (5s)': p.predQ50 != null ? +p.predQ50.toFixed(4) : null,
-    Q10:        p.predQ10 != null ? +p.predQ10.toFixed(4) : null,
-    Q90:        p.predQ90 != null ? +p.predQ90.toFixed(4) : null,
+    'Q50 (5s)': null,
+    Q10:        null,
+    Q90:        null,
   }))
 
+  if (hasPreds) {
+    const q10 = +latestPredictions!['q10'].toFixed(4)
+    const q50 = +latestPredictions!['q50'].toFixed(4)
+    const q90 = +latestPredictions!['q90'].toFixed(4)
+
+    // Anchor the Q lines at the last real data point so they start at "now"
+    formatted[formatted.length - 1] = {
+      ...formatted[formatted.length - 1],
+      'Q50 (5s)': q50,
+      Q10:        q10,
+      Q90:        q90,
+    }
+
+    // Project forward to T+5s — this point has no real price data
+    formatted.push({
+      time:       formatTime(lastPoint.time + PRED_HORIZON_MS),
+      Mid:        null,
+      Bid:        null,
+      Ask:        null,
+      'Q50 (5s)': q50,
+      Q10:        q10,
+      Q90:        q90,
+    })
+  }
+
+  // Domain: include Q values so the future points are always in view
   const allPrices = data.flatMap(p => [p.bestBid, p.bestAsk])
+  if (hasPreds) {
+    allPrices.push(latestPredictions!['q10'], latestPredictions!['q90'])
+  }
   const min = Math.min(...allPrices)
   const max = Math.max(...allPrices)
   const pad = (max - min) * 0.15 || 0.02
   const domain: [number, number] = [+(min - pad).toFixed(4), +(max + pad).toFixed(4)]
-
-  const hasPreds = latestPredictions != null &&
-    (latestPredictions['q10'] != null || latestPredictions['q50'] != null)
 
   return (
     <div>

@@ -43,16 +43,30 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Model
 # ──────────────────────────────────────────────────────────────
 
-_N_LEVELS       = 5
-_XGB_MIN_BUFFER = 7   # max_lag(5) + 1 extra to absorb the NaN from ofi.diff(1)
-
 _xgb_models: Optional[dict] = None   # {0.1: Pipeline, 0.5: Pipeline, 0.9: Pipeline}
-_xgb_feat_cols: list[str]   = []
-_xgb_quantiles: list[float] = []
+_xgb_feat_cols:   list[str]   = []
+_xgb_quantiles:   list[float] = []
+
+# Feature-engineering config — populated from metadata at load time
+_n_levels:      int        = 5
+_max_min_cols:  list[str]  = []
+_lagged_cols:   list[str]  = []
+_lags:          list[int]  = []
+_roll_ave_cols: list[str]  = []
+_roll_windows:  list[int]  = []
+_pred_window:   int        = 5
+
+# Derived: min rows needed in the buffer before we can predict.
+# ofi = bid_vol.diff(1) → row 0 is NaN; max_lag further shifts require max_lag more rows.
+# Add 1 for safety → total = max_lag + 2.
+_XGB_MIN_BUFFER: int = 7   # updated dynamically in _load_model()
 
 
 def _load_model() -> None:
     global _xgb_models, _xgb_feat_cols, _xgb_quantiles
+    global _n_levels, _max_min_cols, _lagged_cols, _lags
+    global _roll_ave_cols, _roll_windows, _pred_window, _XGB_MIN_BUFFER
+
     model_path = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg.joblib')
     meta_path  = os.path.join(_PROJ_ROOT, 'xgb_quantile_reg_meta.json')
     if not os.path.exists(model_path):
@@ -61,12 +75,26 @@ def _load_model() -> None:
     if not os.path.exists(meta_path):
         logger.warning("xgb_quantile_reg_meta.json not found — predictions disabled")
         return
+
     _xgb_models = joblib.load(model_path)
     with open(meta_path) as f:
         meta = json.load(f)
-    _xgb_feat_cols = meta['feat_cols']
-    _xgb_quantiles = meta['quantiles']
-    logger.info(f"XGB model loaded: {len(_xgb_feat_cols)} features, quantiles={_xgb_quantiles}")
+
+    _xgb_feat_cols  = meta['feat_cols']
+    _xgb_quantiles  = meta['quantiles']
+    _n_levels       = meta.get('n_levels',      _n_levels)
+    _max_min_cols   = meta.get('max_min_cols',   _max_min_cols)
+    _lagged_cols    = meta.get('lagged_cols',    _lagged_cols)
+    _lags           = meta.get('lags',           _lags)
+    _roll_ave_cols  = meta.get('roll_ave_cols',  _roll_ave_cols)
+    _roll_windows   = meta.get('roll_windows',   _roll_windows)
+    _pred_window    = meta.get('pred_window',    _pred_window)
+    _XGB_MIN_BUFFER = (max(_lags) + 2) if _lags else 7
+
+    logger.info(
+        f"XGB model loaded: {len(_xgb_feat_cols)} features, quantiles={_xgb_quantiles}, "
+        f"lags={_lags}, roll_windows={_roll_windows}, buffer={_XGB_MIN_BUFFER}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -98,8 +126,8 @@ def _compute_base_features() -> dict | None:
     if not bids or not asks:
         return None
 
-    top_bids = bids[:_N_LEVELS]
-    top_asks = asks[:_N_LEVELS]
+    top_bids = bids[:_n_levels]
+    top_asks = asks[:_n_levels]
 
     best_bid    = bids[0]['price']
     best_ask    = asks[0]['price']
@@ -124,38 +152,37 @@ def _compute_base_features() -> dict | None:
     ts_s = int(time.time())
 
     row: dict = {
-        # Max/min cols — at ~1 Hz these equal the current snapshot value
-        'best_bid_max':    best_bid,  'best_bid_min':    best_bid,
-        'best_ask_max':    best_ask,  'best_ask_min':    best_ask,
-        'mid_max':         mid_logit, 'mid_min':         mid_logit,
-        'ask_vol_all_max': ask_vol_all, 'ask_vol_all_min': ask_vol_all,
-        'bid_vol_all_max': bid_vol_all, 'bid_vol_all_min': bid_vol_all,
-        # Base cols
-        'best_bid':        best_bid,
-        'best_ask':        best_ask,
-        'bid_vol':         bid_vol,
-        'ask_vol':         ask_vol,
-        'bid_vol_all':     bid_vol_all,
-        'ask_vol_all':     ask_vol_all,
-        'bid_n_levels':    float(len(bids)),
-        'ask_n_levels':    float(len(asks)),
-        'btc_price':       _btc_price,
-        'vwap':            (bid_pxs + ask_pxs) / denom_a,
-        'mid':             mid_logit,          # logit-transformed
-        'spread':          spread,
-        'rel_spread':      spread / (mid_raw + 1e-9),
-        'imbalance':       (bid_vol - ask_vol) / denom_t,
-        'imbalance_all':   (bid_vol_all - ask_vol_all) / denom_a,
-        'microprice':      micro,
-        'micro_minus_mid': micro - mid_raw,    # price-space difference
+        'best_bid':             best_bid,
+        'best_ask':             best_ask,
+        'bid_vol':              bid_vol,
+        'ask_vol':              ask_vol,
+        'bid_vol_all':          bid_vol_all,
+        'ask_vol_all':          ask_vol_all,
+        'bid_n_levels':         float(len(bids)),
+        'ask_n_levels':         float(len(asks)),
+        'btc_price':            _btc_price,
+        'btc_price_from_open':  _btc_price - _btc_open,
+        'vwap':                 (bid_pxs + ask_pxs) / denom_a,
+        'mid':                  mid_logit,          # logit-transformed
+        'spread':               spread,
+        'rel_spread':           spread / (mid_raw + 1e-9),
+        'imbalance':            (bid_vol - ask_vol) / denom_t,
+        'imbalance_all':        (bid_vol_all - ask_vol_all) / denom_a,
+        'microprice':           micro,
+        'micro_minus_mid':      micro - mid_raw,    # price-space difference
         # Temporal (raw seconds, matching notebook: index % 300 / % 86400)
-        'time_in_interval':    float(ts_s % 300),
-        'time_since_midnight': float(ts_s % 86400),
+        'time_in_interval':     float(ts_s % 300),
+        'time_since_midnight':  float(ts_s % 86400),
     }
 
-    for i in range(_N_LEVELS):
+    for i in range(_n_levels):
         row[f'bid_size_L{i+1}'] = top_bids[i]['size'] if i < len(top_bids) else 0.0
         row[f'ask_size_L{i+1}'] = top_asks[i]['size'] if i < len(top_asks) else 0.0
+
+    # Max/min cols driven by metadata (at ~1 Hz these equal the current snapshot value)
+    for col in _max_min_cols:
+        row[f'{col}_max'] = row[col]
+        row[f'{col}_min'] = row[col]
 
     return row
 
@@ -166,16 +193,13 @@ def _build_xgb_features(buf_df: pd.DataFrame) -> pd.DataFrame:
 
     df['ofi'] = df['bid_vol'].diff(1) - df['ask_vol'].diff(1)
 
-    LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
-                   'best_bid_max', 'best_ask_max', 'mid_max',
-                   'best_bid_min', 'best_ask_min', 'mid_min', 'ofi']
-    for lag in [1, 2, 3, 4, 5]:
-        for c in LAGGED_COLS:
+    for lag in _lags:
+        for c in _lagged_cols:
             df[f'{c}_lag{lag}'] = df[c].shift(lag)
 
-    ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask', 'rel_spread']
-    for w in [3, 4, 5]:
-        for c in ROLL_AVE_COLS:
+    for w in _roll_windows:
+        cols = [c for c in _roll_ave_cols if c in df.columns]
+        for c in cols:
             df[f'{c}_ave{w}'] = df[c].rolling(w).mean()
 
     return df

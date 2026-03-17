@@ -145,11 +145,7 @@ export function useMarketStream(slug: string | null) {
         if (priceUpdated) {
           const point = getMidPrice(booksRef.current)
           if (point) {
-            const preds = latestPredsRef.current
-            const enriched: PricePoint = preds
-              ? { ...point, predQ10: preds['q10'], predQ50: preds['q50'], predQ90: preds['q90'] }
-              : point
-            priceHistRef.current = [...priceHistRef.current, enriched].slice(-MAX_PRICE_HISTORY)
+            priceHistRef.current = [...priceHistRef.current, point].slice(-MAX_PRICE_HISTORY)
           }
         }
       }
