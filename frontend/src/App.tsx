@@ -119,6 +119,45 @@ export default function App() {
         </div>
       </div>
 
+      {/* Simulation / portfolio row */}
+      {market.simulation && (() => {
+        const { portfolio, pnl } = market.simulation
+        const pnlColor = pnl >= 0 ? 'text-green-400' : 'text-red-400'
+        const posEntries = Object.entries(portfolio.positions)
+        return (
+          <div className="grid grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Cash</div>
+              <div className="text-xl font-mono font-semibold text-gray-100">
+                ${portfolio.cash.toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Realized PnL</div>
+              <div className={`text-xl font-mono font-semibold ${portfolio.realized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {portfolio.realized_pnl >= 0 ? '+' : ''}{portfolio.realized_pnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Unrealized PnL</div>
+              <div className={`text-xl font-mono font-semibold ${portfolio.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {portfolio.unrealized_pnl >= 0 ? '+' : ''}{portfolio.unrealized_pnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">
+                Position{posEntries.length !== 1 ? 's' : ''}
+              </div>
+              <div className={`text-xl font-mono font-semibold ${pnlColor}`}>
+                {posEntries.length === 0
+                  ? 'flat'
+                  : posEntries.map(([, qty]) => qty.toFixed(2)).join(', ')}
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Stats row */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
