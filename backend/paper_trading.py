@@ -29,6 +29,7 @@ Fill dict shape
 """
 
 import logging
+import math
 import random
 import time
 from abc import ABC, abstractmethod
@@ -91,10 +92,12 @@ class ExecutionEngine:
         taker_fee: float = 0.001,
         maker_fee: float = 0.0,
         slippage_pct: float = 0.002,
+        limit_fill_prob: float = 0.5,
     ) -> None:
-        self.taker_fee   = taker_fee
-        self.maker_fee   = maker_fee
-        self.slippage_pct = slippage_pct
+        self.taker_fee      = taker_fee
+        self.maker_fee      = maker_fee
+        self.slippage_pct   = slippage_pct
+        self.limit_fill_prob = limit_fill_prob  # fill prob when order is right at limit price
         self._open_gtc: list[dict] = []
 
     # ------------------------------------------------------------------
@@ -162,10 +165,31 @@ class ExecutionEngine:
         )
         return bids, asks
 
+    def _limit_fill_prob(self, limit_px: float, level_px: float, side: str) -> float:
+        """Probability of receiving a fill at *level_px* given a limit order at *limit_px*.
+
+        Models queue-position uncertainty: the more aggressively the limit price
+        overshoots the book level, the more volume must trade before us in the
+        queue, so the higher the chance we are reached.
+
+        At rel_overshoot = 0  (level exactly at limit):  prob = limit_fill_prob
+        As rel_overshoot → ∞  (very aggressive limit):   prob → 1.0
+
+        Formula: prob = 1 − (1 − base) × exp(−k × rel_overshoot)
+        where k = 20 gives saturation around a 15–20% overshoot.
+        """
+        if side == 'BUY':
+            rel_overshoot = (limit_px - level_px) / (limit_px + 1e-9)
+        else:
+            rel_overshoot = (level_px - limit_px) / (level_px + 1e-9)
+
+        rel_overshoot = max(0.0, rel_overshoot)
+        return 1.0 - (1.0 - self.limit_fill_prob) * math.exp(-20.0 * rel_overshoot)
+
     def _slip_price(self, base: float, side: str, level_size: float, take: float) -> float:
         """Apply proportional slippage with a small random component."""
         pct   = self.slippage_pct * (1.0 + 3.0 * take / (level_size + 1e-9))
-        noise = (random.random() - 0.5) * 0.2
+        noise = (random.random() - 0.5) * 0.2   # ±10% noise
         if side == 'BUY':
             return base * (1.0 + pct * (1.0 + noise))
         return base * (1.0 - pct * (1.0 + noise))
@@ -210,16 +234,50 @@ class ExecutionEngine:
                 'remaining': quantity, 'status': 'rejected', 'timestamp': ts,
             }
 
+        # ── Classify the order's execution mode ───────────────────────
+        #
+        # Marketable limit (crosses the spread):
+        #   guaranteed fill (no queue draw) + slippage (taker)
+        # Passive / resting limit (GTC retries included):
+        #   queue-position uncertainty (Bernoulli draw per level) + no slippage (maker)
+        # Market order:
+        #   guaranteed fill + slippage (always taker)
+        # FOK:
+        #   deterministic everywhere (handled by the available-check above)
+        if order_type == 'market':
+            use_prob_fill  = False
+            apply_slippage = True
+        else:  # limit
+            if is_gtc_retry:
+                # Was already resting in the book → passive treatment regardless
+                is_marketable = False
+            elif side == 'BUY':
+                best_opp      = asks_sorted[0]['price'] if asks_sorted else float('inf')
+                is_marketable = limit_px >= best_opp
+            else:
+                best_opp      = bids_sorted[0]['price'] if bids_sorted else 0.0
+                is_marketable = limit_px <= best_opp
+            use_prob_fill  = not is_marketable and (tif != 'FOK')
+            apply_slippage = is_marketable
+
         # Walk the book best-first
         filled = 0.0
         cost   = 0.0
         for lv in levels:
             if filled >= quantity:
                 break
+            if use_prob_fill:
+                prob = self._limit_fill_prob(limit_px, lv['price'], side)
+                if random.random() > prob:
+                    continue   # queue didn't reach our order at this level
             take       = min(quantity - filled, lv['size'])
-            fill_price = self._slip_price(lv['price'], side, lv['size'], take)
-            filled    += take
-            cost      += take * fill_price
+            fill_price = (
+                self._slip_price(lv['price'], side, lv['size'], take)
+                if apply_slippage
+                else lv['price']   # passive maker: fill at exact book price
+            )
+            filled += take
+            cost   += take * fill_price
 
         remaining = max(0.0, quantity - filled)
 
@@ -390,10 +448,12 @@ class Simulator:
         taker_fee: float = 0.001,
         maker_fee: float = 0.0,
         slippage_pct: float = 0.002,
+        limit_fill_prob: float = 0.5,
     ) -> None:
         self.strategy       = strategy
         self.engine         = ExecutionEngine(
-            taker_fee=taker_fee, maker_fee=maker_fee, slippage_pct=slippage_pct,
+            taker_fee=taker_fee, maker_fee=maker_fee,
+            slippage_pct=slippage_pct, limit_fill_prob=limit_fill_prob,
         )
         self.portfolio      = Portfolio(starting_cash=starting_cash)
         self._starting_cash = starting_cash
@@ -471,6 +531,7 @@ class Simulator:
             taker_fee=self.engine.taker_fee,
             maker_fee=self.engine.maker_fee,
             slippage_pct=self.engine.slippage_pct,
+            limit_fill_prob=self.engine.limit_fill_prob,
         )
         self.portfolio   = Portfolio(starting_cash=self._starting_cash)
         self._tick_count = 0

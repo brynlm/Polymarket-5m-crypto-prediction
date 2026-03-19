@@ -319,7 +319,7 @@ _simulator: Simulator = Simulator(
         exit_threshold=0.005,
         position_frac=0.1,
     ),
-    starting_cash=1000.0,
+    starting_cash=50.0,
     taker_fee=0.001,
     slippage_pct=0.002,
 )
