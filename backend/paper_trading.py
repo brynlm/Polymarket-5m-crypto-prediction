@@ -515,6 +515,7 @@ class Simulator:
             logger.warning('[Simulator] strategy error on tick %d: %s', self._tick_count, exc)
             orders = []
 
+        orders = self._cap_orders(orders, best_ask)
         fills = self.engine.process_orders(orders, order_book)
         self.portfolio.apply_fills(fills)
 
@@ -524,6 +525,57 @@ class Simulator:
             'portfolio': snap,
             'pnl':       snap['realized_pnl'] + snap['unrealized_pnl'],
         }
+
+    def _cap_orders(self, orders: list[dict], best_ask: float) -> list[dict]:
+        """Clip order quantities to what the portfolio can actually afford.
+
+        BUY orders
+        ----------
+        Worst-case cost per unit is estimated as ``ref_price × (1 + taker_fee
+        + slippage_pct)``, where ``ref_price`` is the order's limit price for
+        limit orders or ``best_ask`` for market orders.  Orders are processed
+        in the sequence the strategy emitted them so earlier orders have
+        priority when cash is tight.  Orders that cannot afford even a single
+        unit are dropped entirely.
+
+        SELL orders
+        -----------
+        Quantity is capped at the currently held position.  Orders against an
+        asset with no open position are dropped (no short-selling).
+
+        The cash/position budget is tracked across the whole batch so multiple
+        orders in the same tick cannot collectively exceed available resources.
+        """
+        capped: list[dict] = []
+        remaining_cash = self.portfolio.cash
+        # Conservative price buffer covers taker fee + full slippage allowance
+        cost_buffer = 1.0 + self.engine.taker_fee + self.engine.slippage_pct
+
+        for order in orders:
+            side     = order['side']
+            qty      = float(order['quantity'])
+            asset_id = order.get('asset_id', '')
+
+            if side == 'BUY':
+                ref_price    = float(order['price']) if order.get('price') else best_ask
+                cost_per_unit = ref_price * cost_buffer
+                if cost_per_unit <= 0 or remaining_cash <= 0:
+                    continue
+                max_qty    = remaining_cash / cost_per_unit
+                capped_qty = min(qty, max_qty)
+                if capped_qty <= 1e-9:
+                    continue
+                remaining_cash -= capped_qty * cost_per_unit
+                capped.append({**order, 'quantity': capped_qty})
+
+            else:  # SELL
+                held = self.portfolio.positions.get(asset_id, 0.0)
+                if held <= 1e-9:
+                    continue
+                capped_qty = min(qty, held)
+                capped.append({**order, 'quantity': capped_qty})
+
+        return capped
 
     def reset(self) -> None:
         """Reset portfolio and engine to initial state; strategy is preserved."""
