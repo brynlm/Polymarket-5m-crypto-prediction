@@ -11,6 +11,29 @@ class PassiveStrategy(BaseStrategy):
     """Does nothing — useful as a no-op baseline / placeholder."""
 
     def on_tick(self, state: dict) -> list[dict]:
+        asset_id= state['asset_id']
+        mid     = state['mid_price']
+        portfolio = state['portfolio']
+        cash    = portfolio['cash']
+        best_ask= state['features']['best_ask']
+        best_bid= state['features']['best_bid']
+        position= portfolio['positions'].get(asset_id, 0.0)
+
+        orders: list[dict] = []
+        if mid <= 0.4 and cash > 0:
+            qty = (cash * 0.25) / best_ask
+            orders.append({
+                'asset_id': asset_id, 'side': 'BUY', 'order_type': 'limit',
+                'quantity': qty, 'price': best_ask + 0.01, 'time_in_force': 'IOC',
+            })
+            return orders
+        elif mid >= 0.6 and position > 0:
+            orders.append({
+                'asset_id': asset_id, 'side': 'SELL', 'order_type': 'market',
+                'quantity': position, 'price': None, 'time_in_force': 'IOC',
+            })
+            return orders
+
         return []
 
 
