@@ -3,7 +3,12 @@ import { useMarketStream } from './hooks/useMarketStream'
 import { PriceChart } from './components/PriceChart'
 import { OrderBook } from './components/OrderBook'
 
-const API_URL = 'http://localhost:8000'
+const API_URL       = 'http://localhost:8000'
+const INTERVAL_MS   = 5 * 60 * 1000   // 5-minute market interval
+
+function msUntilNextInterval() {
+  return INTERVAL_MS - (Date.now() % INTERVAL_MS)
+}
 
 interface ActiveMarket {
   slug: string
@@ -25,31 +30,34 @@ export default function App() {
 
   const market = useMarketStream(selectedSlug)
 
-  useEffect(() => {
-    let cancelled = false
-
-    async function fetchWithRetry() {
-      // Retry up to 10 times with 1s delay — backend may still be starting up
-      for (let attempt = 0; attempt < 10; attempt++) {
-        try {
-          const r = await fetch(`${API_URL}/api/markets/active`)
-          const data: ActiveMarket[] = await r.json()
-          if (cancelled) return
-          if (data.length > 0) {
-            setActiveMarkets(data)
-            setSelectedSlug(data[0].slug)
-            return
-          }
-        } catch {
-          // backend not ready yet
+  function fetchMarkets(forceSwitch: boolean) {
+    fetch(`${API_URL}/api/markets/active`)
+      .then(r => r.json())
+      .then((data: ActiveMarket[]) => {
+        setActiveMarkets(data)
+        if (data.length > 0) {
+          if (forceSwitch) setSelectedSlug(data[0].slug)
+          else setSelectedSlug(s => s ?? data[0].slug)
         }
-        await new Promise(r => setTimeout(r, 1000))
-      }
-    }
+      })
+      .catch(console.error)
+  }
 
-    fetchWithRetry()
-    return () => { cancelled = true }
-  }, [])
+  // Initial load
+  useEffect(() => { fetchMarkets(false) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-switch at each 5-minute interval boundary
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>
+    function scheduleNext() {
+      timerId = setTimeout(() => {
+        fetchMarkets(true)
+        scheduleNext()
+      }, msUntilNextInterval())
+    }
+    scheduleNext()
+    return () => clearTimeout(timerId)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleCustomSlug() {
     const slug = customSlug.trim()
@@ -70,7 +78,7 @@ export default function App() {
       <div className="flex items-start justify-between mb-5">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-white">Polymarket Dashboard</h1>
-          <p className="text-xs text-gray-500 mt-0.5">{market.currentSlug ?? selectedSlug ?? 'No market selected'}</p>
+          <p className="text-xs text-gray-500 mt-0.5">{selectedSlug ?? 'No market selected'}</p>
         </div>
         <div className="flex items-center gap-2 mt-1">
           <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
@@ -111,6 +119,45 @@ export default function App() {
         </div>
       </div>
 
+      {/* Simulation / portfolio row */}
+      {market.simulation && (() => {
+        const { portfolio, pnl } = market.simulation
+        const pnlColor = pnl >= 0 ? 'text-green-400' : 'text-red-400'
+        const posEntries = Object.entries(portfolio.positions)
+        return (
+          <div className="grid grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Cash</div>
+              <div className="text-xl font-mono font-semibold text-gray-100">
+                ${portfolio.cash.toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Realized PnL</div>
+              <div className={`text-xl font-mono font-semibold ${portfolio.realized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {portfolio.realized_pnl >= 0 ? '+' : ''}{portfolio.realized_pnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">Unrealized PnL</div>
+              <div className={`text-xl font-mono font-semibold ${portfolio.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {portfolio.unrealized_pnl >= 0 ? '+' : ''}{portfolio.unrealized_pnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+              <div className="text-xs text-gray-500 mb-1">
+                Position{posEntries.length !== 1 ? 's' : ''}
+              </div>
+              <div className={`text-xl font-mono font-semibold ${pnlColor}`}>
+                {posEntries.length === 0
+                  ? 'flat'
+                  : posEntries.map(([, qty]) => qty.toFixed(2)).join(', ')}
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Stats row */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
@@ -140,12 +187,12 @@ export default function App() {
             <h2 className="text-sm font-medium text-gray-300">Price History</h2>
             <span className="text-xs text-gray-600">{market.priceHistory.length} points</span>
           </div>
-          <PriceChart data={market.priceHistory} />
+          <PriceChart data={market.priceHistory} predictionHistory={market.predictionHistory} latestPredictions={market.latestPredictions} />
         </div>
 
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
           <h2 className="text-sm font-medium text-gray-300 mb-3">Order Book</h2>
-          <OrderBook books={market.orderBooks} yesTokenId={market.yesTokenId} />
+          <OrderBook books={market.orderBooks} />
         </div>
 
       </div>
