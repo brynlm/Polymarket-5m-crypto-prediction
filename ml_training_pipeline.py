@@ -26,7 +26,7 @@ ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask',
 ROLL_WINDOWS = [3,4,5,10]
 
 # Prediction window
-PRED_WINDOW = 10
+PRED_WINDOW = 5
 
 
 def load_raw_books(data_dir='raw_book_data') -> pd.DataFrame:
@@ -34,7 +34,8 @@ def load_raw_books(data_dir='raw_book_data') -> pd.DataFrame:
     if not paths:
         raise FileNotFoundError(f'No book-*.pkl files found in {data_dir}')
     print(f'Loading {len(paths)} file(s)...')
-    return pd.concat([pd.read_pickle(p) for p in paths], ignore_index=True)
+    data = pd.concat([pd.read_pickle(p) for p in paths], ignore_index=True)
+    return data
 
 def extract_features(df: pd.DataFrame, n_levels: int = 5) -> pd.DataFrame:
 
@@ -169,10 +170,10 @@ def transform_features(downsamp_feat):
 
 
 if __name__ == "__main__":
-    MODEL_NAME = 'xgb_qreg_10s'
-    READ_FROM_PKL = True
+    MODEL_NAME = 'xgb_qreg_5s'
     TARGET_COLS = ['return']
     QUANTILES = [0.1, 0.5, 0.9]
+    LOAD_RAW_DATA = True
 
     models = {q: Pipeline([('scaler', MinMaxScaler()), 
                            ('model', XGBRegressor(
@@ -182,11 +183,11 @@ if __name__ == "__main__":
                                random_state=42))]) 
                 for q in QUANTILES}
     
-    if READ_FROM_PKL:
-        feat = pd.read_pickle('raw_extracted_features.pkl')
-    else:
-        raw_data = load_raw_books() # Load raw data
-        feat = extract_features(raw_data) # Get orderbook features
+    feat = pd.read_pickle('raw_extracted_features.pkl') # Load data
+    if LOAD_RAW_DATA:
+        raw_data = load_raw_books() # Load raw data (if any)
+        raw_feat = extract_features(raw_data) # Get orderbook features
+        feat = pd.concat([feat, raw_feat]) # Combine with old data
         feat.to_pickle('raw_extracted_features.pkl') # Save to pkl for later
 
     feat['mid'] = _logit(feat['mid']) # Transform mid price to logit space
