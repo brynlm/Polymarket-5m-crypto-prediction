@@ -28,7 +28,8 @@ const INITIAL_STATE: MarketState = {
 export function useMarketStream(slug: string | null) {
   const [state, setState] = useState<MarketState>(INITIAL_STATE)
 
-  const wsRef = useRef<WebSocket | null>(null)
+  const wsRef            = useRef<WebSocket | null>(null)
+  const reconnectRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // All mutable data lives in refs — onmessage writes here, interval flushes to React state
   const booksRef       = useRef<Record<string, OrderBook>>({})
@@ -54,7 +55,21 @@ export function useMarketStream(slug: string | null) {
   }, [])
 
   const connect = useCallback((targetSlug: string) => {
-    wsRef.current?.close()
+    // Clear any pending reconnect timer
+    if (reconnectRef.current) {
+      clearTimeout(reconnectRef.current)
+      reconnectRef.current = null
+    }
+
+    // Null out old handlers before closing so the old onclose doesn't
+    // overwrite statusRef after we've already set it to 'connecting'
+    if (wsRef.current) {
+      wsRef.current.onopen    = null
+      wsRef.current.onmessage = null
+      wsRef.current.onerror   = null
+      wsRef.current.onclose   = null
+      wsRef.current.close()
+    }
 
     // Reset all refs and immediately show connecting state
     booksRef.current       = {}
@@ -154,13 +169,22 @@ export function useMarketStream(slug: string | null) {
     }
 
     ws.onerror = () => { statusRef.current = 'error' }
-    ws.onclose = () => { statusRef.current = 'disconnected' }
+    ws.onclose = () => {
+      statusRef.current = 'disconnected'
+      reconnectRef.current = setTimeout(() => connect(targetSlug), 2000)
+    }
   }, [])
 
   useEffect(() => {
     if (!slug) return
     connect(slug)
-    return () => { wsRef.current?.close() }
+    return () => {
+      if (reconnectRef.current) clearTimeout(reconnectRef.current)
+      if (wsRef.current) {
+        wsRef.current.onclose = null  // prevent reconnect loop on unmount
+        wsRef.current.close()
+      }
+    }
   }, [slug, connect])
 
   return state

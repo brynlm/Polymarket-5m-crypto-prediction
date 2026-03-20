@@ -170,10 +170,10 @@ def transform_features(downsamp_feat):
 
 
 if __name__ == "__main__":
-    MODEL_NAME = 'xgb_qreg_5s'
+    MODEL_NAME = 'xgb_qreg_10s'
     TARGET_COLS = ['return']
     QUANTILES = [0.1, 0.5, 0.9]
-    LOAD_RAW_DATA = True
+    LOAD_RAW_DATA = False
 
     models = {q: Pipeline([('scaler', MinMaxScaler()), 
                            ('model', XGBRegressor(

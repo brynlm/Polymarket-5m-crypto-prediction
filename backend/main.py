@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # Paper-trading engine (lives alongside this file)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paper_trading import Simulator
-from strategies import QuantileMomentumStrategy
+from strategies import QuantileMomentumStrategy, PassiveStrategy, BandReversionStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -290,12 +290,14 @@ async def poll_btc_price() -> None:
     global _btc_price, _btc_open
     while True:
         try:
-            resp = requests.get(BINANCE_TICKER_URL, params={"symbol": "BTCUSDT"}, timeout=3)
+            resp = await asyncio.to_thread(
+                requests.get, BINANCE_TICKER_URL, params={"symbol": "BTCUSDT"}, timeout=3
+            )
             price = float(resp.json()['price'])
             _btc_price = price
             if np.isnan(_btc_open):
                 # Fetch the actual candle open so btc_price_from_open matches training
-                _btc_open = _fetch_btc_interval_open()
+                _btc_open = await asyncio.to_thread(_fetch_btc_interval_open)
         except Exception as e:
             logger.warning(f"BTC price poll failed: {e}")
         await asyncio.sleep(2)
@@ -319,7 +321,9 @@ _simulator: Simulator = Simulator(
         exit_threshold=0.005,
         position_frac=0.1,
     ),
-    starting_cash=50.0,
+    # strategy=PassiveStrategy(),
+    # strategy=BandReversionStrategy(),
+    starting_cash=500.0,
     taker_fee=0.001,
     slippage_pct=0.002,
 )
@@ -371,92 +375,95 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
     _tick_buffer.clear()
 
     logger.info(f"Starting Polymarket stream for {len(token_ids)} tokens")
-    try:
-        async with websockets.connect(POLYMARKET_WS, ping_interval=5) as ws:
-            await ws.send(json.dumps({
-                "action": "subscribe",
-                "type": "market",
-                "assets_ids": token_ids,
-                "custom_feature_enabled": True,
-            }))
+    while True:
+        try:
+            async with websockets.connect(POLYMARKET_WS, ping_interval=5) as ws:
+                await ws.send(json.dumps({
+                    "action": "subscribe",
+                    "type": "market",
+                    "assets_ids": token_ids,
+                    "custom_feature_enabled": True,
+                }))
 
-            while True:
-                raw = await ws.recv()
-                await broadcast(raw)
+                while True:
+                    raw = await ws.recv()
+                    await broadcast(raw)
 
-                # Track book state
-                messages = json.loads(raw)
-                if not isinstance(messages, list):
-                    messages = [messages]
+                    # Track book state
+                    messages = json.loads(raw)
+                    if not isinstance(messages, list):
+                        messages = [messages]
 
-                for m in messages:
-                    asset_id = m.get('asset_id')
-                    if asset_id:
-                        _apply_book_update(asset_id, m)
+                    for m in messages:
+                        asset_id = m.get('asset_id')
+                        if asset_id:
+                            _apply_book_update(asset_id, m)
 
-                now = time.time()
-                if not _curr_books:
-                    continue
+                    now = time.time()
+                    if not _curr_books:
+                        continue
 
-                # Accumulate every sub-second tick
-                tick = _compute_base_features()
-                if tick is None:
-                    continue
-                _tick_buffer.append(tick)
+                    # Accumulate every sub-second tick
+                    tick = _compute_base_features()
+                    if tick is None:
+                        continue
+                    _tick_buffer.append(tick)
 
-                # At each new second boundary: aggregate ticks → 1s row
-                this_second = int(now)
-                if this_second <= _current_second:
-                    continue
-                _current_second = this_second
+                    # At each new second boundary: aggregate ticks → 1s row
+                    this_second = int(now)
+                    if this_second <= _current_second:
+                        continue
+                    _current_second = this_second
 
-                # Reset buffer on interval rollover
-                interval_end = _get_interval_end()
-                if interval_end != _interval_end:
-                    _interval_end = interval_end
-                    _btc_open = _fetch_btc_interval_open()
-                    _feature_buffer.clear()
+                    # Reset buffer on interval rollover
+                    interval_end = _get_interval_end()
+                    if interval_end != _interval_end:
+                        _interval_end = interval_end
+                        _btc_open = await asyncio.to_thread(_fetch_btc_interval_open)
+                        _feature_buffer.clear()
 
-                row_1s = _aggregate_1s_row(_tick_buffer)
-                _tick_buffer.clear()
+                    row_1s = _aggregate_1s_row(_tick_buffer)
+                    _tick_buffer.clear()
 
-                _feature_buffer.append(row_1s)
-                if len(_feature_buffer) > _XGB_MIN_BUFFER * 4:
-                    _feature_buffer = _feature_buffer[-_XGB_MIN_BUFFER * 4:]
+                    _feature_buffer.append(row_1s)
+                    if len(_feature_buffer) > _XGB_MIN_BUFFER * 4:
+                        _feature_buffer = _feature_buffer[-_XGB_MIN_BUFFER * 4:]
 
-                preds = _try_predict()
-                if preds:
-                    await broadcast(json.dumps({
-                        'event_type':  'prediction',
-                        'timestamp':   int(now * 1000),
-                        'predictions': preds,
-                    }))
-
-                # ── Paper-trading simulation ───────────────────────────
-                asset_id = current_token_ids[0] if current_token_ids else None
-                book = next(iter(_curr_books.values()), None) if asset_id is None else _curr_books.get(asset_id)
-                if asset_id and book:
-                    sim_result = _simulator.on_tick(
-                        asset_id    = asset_id,
-                        order_book  = book,
-                        predictions = preds,
-                        features    = row_1s,
-                        timestamp   = int(now * 1000),
-                    )
-                    if sim_result['fills'] or True:   # broadcast every tick so dashboard stays live
+                    preds = await asyncio.to_thread(_try_predict)
+                    if preds:
                         await broadcast(json.dumps({
-                            'event_type': 'simulation',
-                            'timestamp':  int(now * 1000),
-                            'fills':      sim_result['fills'],
-                            'portfolio':  sim_result['portfolio'],
-                            'pnl':        sim_result['pnl'],
+                            'event_type':  'prediction',
+                            'timestamp':   int(now * 1000),
+                            'predictions': preds,
                         }))
 
-    except asyncio.CancelledError:
-        logger.info("Stream cancelled")
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        await broadcast(json.dumps({"event_type": "error", "message": str(e)}))
+                    # ── Paper-trading simulation ───────────────────────────
+                    asset_id = current_token_ids[0] if current_token_ids else None
+                    book = next(iter(_curr_books.values()), None) if asset_id is None else _curr_books.get(asset_id)
+                    if asset_id and book:
+                        sim_result = _simulator.on_tick(
+                            asset_id    = asset_id,
+                            order_book  = book,
+                            predictions = preds,
+                            features    = row_1s,
+                            timestamp   = int(now * 1000),
+                        )
+                        if sim_result['fills'] or True:   # broadcast every tick so dashboard stays live
+                            await broadcast(json.dumps({
+                                'event_type': 'simulation',
+                                'timestamp':  int(now * 1000),
+                                'fills':      sim_result['fills'],
+                                'portfolio':  sim_result['portfolio'],
+                                'pnl':        sim_result['pnl'],
+                            }))
+
+        except asyncio.CancelledError:
+            logger.info("Stream cancelled")
+            return
+        except Exception as e:
+            logger.error(f"Stream error: {e}, restarting in 2s...")
+            await broadcast(json.dumps({"event_type": "error", "message": str(e)}))
+            await asyncio.sleep(2)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -531,7 +538,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not slug:
                     continue
 
-                token_ids, _ = get_token_ids(slug)
+                token_ids, _ = await asyncio.to_thread(get_token_ids, slug)
                 if not token_ids:
                     await websocket.send_text(json.dumps({
                         "event_type": "error",
