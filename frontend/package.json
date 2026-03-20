@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -n backend,frontend -c blue,green \"cd .. && conda run -n rl uvicorn backend.main:app --reload\" \"vite\"",
+    "dev": "concurrently -n backend,frontend -c blue,green \"cd .. && conda run -n rl uvicorn backend.main:app --reload --reload-dir backend\" \"vite\"",
     "dev:frontend": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
