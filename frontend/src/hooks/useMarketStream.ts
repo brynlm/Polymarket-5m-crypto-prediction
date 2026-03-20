@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { MarketState, OrderBook, PricePoint, PredictionPoint, OrderBookEntry, SimulationState } from '../types'
+import type { MarketState, OrderBook, PricePoint, PredictionPoint, OrderBookEntry } from '../types'
 
 const WS_URL            = 'ws://localhost:8000/ws'
 const MAX_PRICE_HISTORY = 300
@@ -22,7 +22,7 @@ function parseEntries(raw: { price: string; size: string }[], descending: boolea
 
 const INITIAL_STATE: MarketState = {
   orderBooks: {}, priceHistory: [], predictionHistory: [],
-  latestPredictions: null, simulation: null, status: 'disconnected',
+  latestPredictions: null, status: 'disconnected',
 }
 
 export function useMarketStream(slug: string | null) {
@@ -36,7 +36,6 @@ export function useMarketStream(slug: string | null) {
   const priceHistRef   = useRef<PricePoint[]>([])
   const predHistRef    = useRef<PredictionPoint[]>([])
   const latestPredsRef = useRef<Record<string, number> | null>(null)
-  const simulationRef  = useRef<SimulationState | null>(null)
   const statusRef      = useRef<MarketState['status']>('disconnected')
 
   // 1-second flush: copy refs into React state (the only setState call in the hot path)
@@ -47,7 +46,6 @@ export function useMarketStream(slug: string | null) {
         priceHistory:      priceHistRef.current,
         predictionHistory: predHistRef.current,
         latestPredictions: latestPredsRef.current,
-        simulation:        simulationRef.current,
         status:            statusRef.current,
       })
     }, FLUSH_INTERVAL_MS)
@@ -76,7 +74,6 @@ export function useMarketStream(slug: string | null) {
     priceHistRef.current   = []
     predHistRef.current    = []
     latestPredsRef.current = null
-    simulationRef.current  = null
     statusRef.current      = 'connecting'
     setState({ ...INITIAL_STATE, status: 'connecting' })
 
@@ -104,15 +101,6 @@ export function useMarketStream(slug: string | null) {
           }
           predHistRef.current    = [...predHistRef.current, predPoint].slice(-MAX_PRED_HISTORY)
           latestPredsRef.current = predPoint.predictions
-          continue
-        }
-
-        if (eventType === 'simulation') {
-          simulationRef.current = {
-            portfolio:   msg.portfolio   as SimulationState['portfolio'],
-            latestFills: msg.fills       as SimulationState['latestFills'],
-            pnl:         msg.pnl         as number,
-          }
           continue
         }
 

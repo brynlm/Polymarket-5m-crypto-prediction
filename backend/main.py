@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import sys
 import time
 import logging
 from typing import Optional
@@ -14,11 +13,6 @@ import websockets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
-# Paper-trading engine (lives alongside this file)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paper_trading import Simulator
-from strategies import QuantileMomentumStrategy, PassiveStrategy, BandReversionStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -311,24 +305,6 @@ active_clients: set[WebSocket] = set()
 stream_task: Optional[asyncio.Task] = None
 current_token_ids: list[str] = []
 
-# ──────────────────────────────────────────────────────────────
-# Paper-trading simulator  (swap strategy here to experiment)
-# ──────────────────────────────────────────────────────────────
-
-_simulator: Simulator = Simulator(
-    strategy=QuantileMomentumStrategy(
-        entry_threshold=0.01,
-        exit_threshold=0.005,
-        position_frac=0.1,
-    ),
-    # strategy=PassiveStrategy(),
-    # strategy=BandReversionStrategy(),
-    starting_cash=500.0,
-    taker_fee=0.001,
-    slippage_pct=0.002,
-)
-
-
 async def broadcast(message: str) -> None:
     dead = set()
     for client in active_clients:
@@ -437,26 +413,6 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                             'predictions': preds,
                         }))
 
-                    # ── Paper-trading simulation ───────────────────────────
-                    asset_id = current_token_ids[0] if current_token_ids else None
-                    book = next(iter(_curr_books.values()), None) if asset_id is None else _curr_books.get(asset_id)
-                    if asset_id and book:
-                        sim_result = _simulator.on_tick(
-                            asset_id    = asset_id,
-                            order_book  = book,
-                            predictions = preds,
-                            features    = row_1s,
-                            timestamp   = int(now * 1000),
-                        )
-                        if sim_result['fills'] or True:   # broadcast every tick so dashboard stays live
-                            await broadcast(json.dumps({
-                                'event_type': 'simulation',
-                                'timestamp':  int(now * 1000),
-                                'fills':      sim_result['fills'],
-                                'portfolio':  sim_result['portfolio'],
-                                'pnl':        sim_result['pnl'],
-                            }))
-
         except asyncio.CancelledError:
             logger.info("Stream cancelled")
             return
@@ -551,7 +507,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         stream_task.cancel()
                         await asyncio.sleep(0.1)
                     current_token_ids = token_ids
-                    _simulator.reset()
                     stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
                 elif not stream_task or stream_task.done():
                     stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
