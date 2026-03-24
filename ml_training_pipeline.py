@@ -22,7 +22,7 @@ LAGGED_COLS = ['best_bid', 'best_ask', 'mid',
                'best_bid_min', 'best_ask_min', 'mid_min', 'ofi']
 LAGS = [1,2,3,4,5]
 ROLL_AVE_COLS = ['mid', 'spread', 'vwap', 'best_bid', 'best_ask',
-                'rel_spread', 'btc_price', 'btc_price_from_open']
+                'rel_spread']#, 'btc_price', 'btc_price_from_open']
 ROLL_WINDOWS = [3,4,5,10]
 
 # Prediction window
@@ -142,9 +142,10 @@ def downsample_features_1s(feat, max_min_cols, ave_cols):
 
 def transform_features(downsamp_feat):
     # Add BTC Price From Open features:
-    downsamp_feat['btc_price_from_open'] = downsamp_feat['btc_price'].groupby(
-        (downsamp_feat.index // 300) * 300, group_keys=False).apply(
-            lambda x: x - x.iloc[0], include_groups=False)
+
+    # downsamp_feat['btc_price_from_open'] = downsamp_feat['btc_price'].groupby(
+    #     (downsamp_feat.index // 300) * 300, group_keys=False).apply(
+    #         lambda x: x - x.iloc[0], include_groups=False)
 
     # Add Order Flow Imbalance feature:
     downsamp_feat['ofi'] = downsamp_feat['bid_vol'].diff(1) - downsamp_feat['ask_vol'].diff(1)
@@ -170,7 +171,7 @@ def transform_features(downsamp_feat):
 
 
 if __name__ == "__main__":
-    MODEL_NAME = 'xgb_qreg_10s'
+    MODEL_NAME = 'xgb_qreg_5s'
     TARGET_COLS = ['return']
     QUANTILES = [0.1, 0.5, 0.9]
     LOAD_RAW_DATA = False
@@ -184,6 +185,7 @@ if __name__ == "__main__":
                 for q in QUANTILES}
     
     feat = pd.read_pickle('raw_extracted_features.pkl') # Load data
+    feat = feat.drop(columns='btc_price') # <-- drop btc_price features for now
     if LOAD_RAW_DATA:
         raw_data = load_raw_books() # Load raw data (if any)
         raw_feat = extract_features(raw_data) # Get orderbook features
