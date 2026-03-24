@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _load_model()
-    asyncio.create_task(poll_btc_price())
     yield
 
 
@@ -42,15 +41,13 @@ app.add_middleware(
 
 POLYMARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_API = "https://gamma-api.polymarket.com"
-BINANCE_TICKER_URL  = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_KLINES_URL  = "https://api.binance.com/api/v3/klines"
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ──────────────────────────────────────────────────────────────
 # Model
 # ──────────────────────────────────────────────────────────────
 
-MODEL_NAME = 'xgb_qreg_10s'
+MODEL_NAME = 'xgb_qreg_5s'
 
 _xgb_models: Optional[dict] = None   # {0.1: Pipeline, 0.5: Pipeline, 0.9: Pipeline}
 _xgb_feat_cols:   list[str]   = []
@@ -120,8 +117,6 @@ _feature_buffer: list[dict]  = []
 _tick_buffer:    list[dict]  = []   # sub-second raw snapshots, aggregated each second
 _current_second: int         = 0    # last second boundary that was aggregated
 
-_btc_price:    float = float('nan')
-_btc_open:     float = float('nan')
 _interval_end: int   = 0          # Unix-second timestamp of current interval end
 
 
@@ -174,8 +169,6 @@ def _compute_base_features() -> dict | None:
         'ask_vol_all':          ask_vol_all,
         'bid_n_levels':         float(len(bids)),
         'ask_n_levels':         float(len(asks)),
-        'btc_price':            _btc_price,
-        'btc_price_from_open':  _btc_price - _btc_open,
         'vwap':                 (bid_pxs + ask_pxs) / denom_a,
         'mid':                  mid_logit,          # logit-transformed
         'spread':               spread,
@@ -272,35 +265,6 @@ def _try_predict() -> dict | None:
 # Background tasks
 # ──────────────────────────────────────────────────────────────
 
-def _fetch_btc_interval_open() -> float:
-    """Return the open price of the current 5-minute BTC/USDT candle from Binance klines."""
-    try:
-        resp = requests.get(
-            BINANCE_KLINES_URL,
-            params={"symbol": "BTCUSDT", "interval": "5m", "limit": 1},
-            timeout=3,
-        )
-        return float(resp.json()[0][1])   # [0] = latest candle, [1] = open price
-    except Exception as e:
-        logger.warning(f"BTC interval open fetch failed: {e}")
-        return float('nan')
-
-
-async def poll_btc_price() -> None:
-    global _btc_price, _btc_open
-    while True:
-        try:
-            resp = await asyncio.to_thread(
-                requests.get, BINANCE_TICKER_URL, params={"symbol": "BTCUSDT"}, timeout=3
-            )
-            price = float(resp.json()['price'])
-            _btc_price = price
-            if np.isnan(_btc_open):
-                # Fetch the actual candle open so btc_price_from_open matches training
-                _btc_open = await asyncio.to_thread(_fetch_btc_interval_open)
-        except Exception as e:
-            logger.warning(f"BTC price poll failed: {e}")
-        await asyncio.sleep(2)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -351,7 +315,7 @@ def _apply_book_update(asset_id: str, msg: dict) -> None:
 
 
 async def run_polymarket_stream(token_ids: list[str]) -> None:
-    global _curr_books, _feature_buffer, _tick_buffer, _current_second, _btc_open, _interval_end
+    global _curr_books, _feature_buffer, _tick_buffer, _current_second, _interval_end
     _curr_books.clear()
     _feature_buffer.clear()
     _tick_buffer.clear()
@@ -401,7 +365,6 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                     interval_end = _get_interval_end()
                     if interval_end != _interval_end:
                         _interval_end = interval_end
-                        _btc_open = await asyncio.to_thread(_fetch_btc_interval_open)
                         _feature_buffer.clear()
 
                     row_1s = _aggregate_1s_row(_tick_buffer)
