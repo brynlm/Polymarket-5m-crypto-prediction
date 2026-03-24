@@ -27,20 +27,29 @@ export default function App() {
   const [activeMarkets, setActiveMarkets] = useState<ActiveMarket[]>([])
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null)
   const [customSlug, setCustomSlug] = useState('')
+  const [wakingUp, setWakingUp] = useState(false)
 
   const market = useMarketStream(selectedSlug)
 
-  function fetchMarkets(forceSwitch: boolean) {
+  function fetchMarkets(forceSwitch: boolean, attempt = 0) {
     fetch(`${API_URL}/api/markets/active`)
       .then(r => r.json())
       .then((data: ActiveMarket[]) => {
+        setWakingUp(false)
         setActiveMarkets(data)
         if (data.length > 0) {
           if (forceSwitch) setSelectedSlug(data[0].slug)
           else setSelectedSlug(s => s ?? data[0].slug)
         }
       })
-      .catch(console.error)
+      .catch(() => {
+        if (attempt < 24) {  // retry for up to ~2 minutes
+          setWakingUp(true)
+          setTimeout(() => fetchMarkets(forceSwitch, attempt + 1), 5000)
+        } else {
+          setWakingUp(false)
+        }
+      })
   }
 
   // Initial load
@@ -78,7 +87,9 @@ export default function App() {
       <div className="flex items-start justify-between mb-5">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-white">Polymarket Dashboard</h1>
-          <p className="text-xs text-gray-500 mt-0.5">{selectedSlug ?? 'No market selected'}</p>
+          <p className="text-xs text-gray-500 mt-0.5">
+            {wakingUp ? 'Waking up server...' : (selectedSlug ?? 'No market selected')}
+          </p>
         </div>
         <div className="flex items-center gap-2 mt-1">
           <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
