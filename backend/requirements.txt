@@ -5,4 +5,5 @@ requests
 joblib
 numpy
 pandas
+sklearn
 xgboost
