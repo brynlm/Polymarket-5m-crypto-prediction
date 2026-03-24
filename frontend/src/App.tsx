@@ -3,7 +3,7 @@ import { useMarketStream } from './hooks/useMarketStream'
 import { PriceChart } from './components/PriceChart'
 import { OrderBook } from './components/OrderBook'
 
-const API_URL       = 'http://localhost:8000'
+const API_URL       = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 const INTERVAL_MS   = 5 * 60 * 1000   // 5-minute market interval
 
 function msUntilNextInterval() {

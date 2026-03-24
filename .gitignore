@@ -19,6 +19,13 @@ logs/
 *.csv
 *.zip
 raw_book_data/**.pkl
+*.pkl
+*.ipynb
+
+# Misc
+.DS_Store
+predictions.png
+predictions_rf.png
 
 # IDE
 .vscode/

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import type { MarketState, OrderBook, PricePoint, PredictionPoint, OrderBookEntry } from '../types'
 
-const WS_URL            = 'ws://localhost:8000/ws'
+const WS_URL            = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 const MAX_PRICE_HISTORY = 300
 const MAX_PRED_HISTORY  = 300
 const FLUSH_INTERVAL_MS = 1000   // flush refs → React state at 1 Hz
