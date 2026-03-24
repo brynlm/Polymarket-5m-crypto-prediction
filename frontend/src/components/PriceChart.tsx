@@ -37,7 +37,6 @@ function findNearestPreds(
   return Math.abs(best.time - time) <= maxDeltaMs ? best.predictions : null
 }
 
-const PRED_HORIZON_MS = 5000
 
 const SERIES = [
   { key: 'Mid',      color: '#60a5fa', width: 2,   dash: undefined },
@@ -109,27 +108,12 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
     }
   })
 
-  // Project the latest predictions forward to T+5s
-  if (hasPreds) {
-    const q10 = +latestPredictions!['q10'].toFixed(4)
-    const q50 = +latestPredictions!['q50'].toFixed(4)
-    const q90 = +latestPredictions!['q90'].toFixed(4)
-    formatted.push({
-      time:       formatTime(lastPoint.time + PRED_HORIZON_MS),
-      Mid:        null,
-      Bid:        null,
-      Ask:        null,
-      'Q50 (5s)': q50,
-      Q10:        q10,
-      Q90:        q90,
-    })
-  }
-
-  // Domain: include Q values so the future points are always in view
+  // Domain: include Q values in range
   const allPrices = windowData.flatMap(p => [p.bestBid, p.bestAsk])
-  if (hasPreds) {
-    allPrices.push(latestPredictions!['q10'], latestPredictions!['q90'])
-  }
+  formatted.forEach(p => {
+    if (p.Q10 != null) allPrices.push(p.Q10)
+    if (p.Q90 != null) allPrices.push(p.Q90)
+  })
   const min = Math.min(...allPrices)
   const max = Math.max(...allPrices)
   const pad = (max - min) * 0.15 || 0.02
