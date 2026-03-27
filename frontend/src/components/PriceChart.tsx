@@ -59,6 +59,17 @@ type ChartPoint = {
   Q90:        number | null
 }
 
+const TRANSITION_MS = 200
+
+function lerp(a: number | null, b: number | null, t: number): number | null {
+  if (a == null || b == null) return b
+  return a + (b - a) * t
+}
+
+function smoothstep(t: number) {
+  return t * t * (3 - 2 * t)
+}
+
 const DEFAULT_VISIBLE: Record<SeriesKey, boolean> = {
   'Mid': true, 'Bid': true, 'Ask': true, 'Q50 (5s)': true, 'Q10': true, 'Q90': true,
 }
@@ -80,6 +91,7 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
   const [now, setNow] = useState(() => Date.now())
   const rafRef = useRef<number>(0)
   const windowFilledRef = useRef(false)
+  const transitionRef = useRef<{ from: ChartPoint; to: ChartPoint; startedAt: number } | null>(null)
 
   useEffect(() => {
     const tick = () => {
@@ -137,11 +149,25 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
     }
   })
 
-  // Phantom "live" point pinned to now — holds last known values so each series
-  // traces smoothly to the right edge rather than jumping when a new point arrives.
-  const last = formatted[formatted.length - 1]
-  if (last && last.ts < now) {
-    formatted.push({ ...last, ts: now })
+  // Phantom "live" point pinned to now with interpolated Y values so the dot
+  // smoothly transitions to each new data point rather than jumping.
+  const realLast = formatted[formatted.length - 1]
+  if (realLast && realLast.ts < now) {
+    const prev = transitionRef.current
+    if (!prev || prev.to.ts !== realLast.ts) {
+      transitionRef.current = { from: prev?.to ?? realLast, to: realLast, startedAt: now }
+    }
+    const { from, to, startedAt } = transitionRef.current!
+    const t = smoothstep(Math.min(1, (now - startedAt) / TRANSITION_MS))
+    formatted.push({
+      ts:         now,
+      Mid:        lerp(from.Mid, to.Mid, t),
+      Bid:        lerp(from.Bid, to.Bid, t),
+      Ask:        lerp(from.Ask, to.Ask, t),
+      'Q50 (5s)': lerp(from['Q50 (5s)'], to['Q50 (5s)'], t),
+      Q10:        lerp(from.Q10, to.Q10, t),
+      Q90:        lerp(from.Q90, to.Q90, t),
+    })
   }
 
   // Domain: include Q values in range
