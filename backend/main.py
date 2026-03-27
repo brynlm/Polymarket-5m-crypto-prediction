@@ -49,7 +49,8 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_NAME = 'xgb_qreg_5s'
 
-_xgb_models: Optional[dict] = None   # {0.1: Pipeline, 0.5: Pipeline, 0.9: Pipeline}
+_xgb_models: Optional[dict] = None   # {'UP': {0.1: Pipeline, ...}, 'DOWN': {...}}
+_xgb_markets:     list[str]   = []
 _xgb_feat_cols:   list[str]   = []
 _xgb_quantiles:   list[float] = []
 
@@ -70,7 +71,7 @@ _XGB_MIN_BUFFER: int = 7   # updated dynamically in _load_model()
 
 
 def _load_model() -> None:
-    global _xgb_models, _xgb_feat_cols, _xgb_quantiles
+    global _xgb_models, _xgb_markets, _xgb_feat_cols, _xgb_quantiles
     global _n_levels, _max_min_cols, _ave_cols, _lagged_cols, _lags
     global _roll_ave_cols, _roll_windows, _pred_window, _XGB_MIN_BUFFER
 
@@ -87,6 +88,7 @@ def _load_model() -> None:
     with open(meta_path) as f:
         meta = json.load(f)
 
+    _xgb_markets    = meta.get('markets',       ['UP', 'DOWN'])
     _xgb_feat_cols  = meta['feat_cols']
     _xgb_quantiles  = meta['quantiles']
     _n_levels       = meta.get('n_levels',      _n_levels)
@@ -112,10 +114,11 @@ def _load_model() -> None:
 # ──────────────────────────────────────────────────────────────
 
 # {asset_id: {'bids': [{'price': float, 'size': float}, ...], 'asks': [...]}}
-_curr_books: dict[str, dict] = {}
-_feature_buffer: list[dict]  = []
-_tick_buffer:    list[dict]  = []   # sub-second raw snapshots, aggregated each second
-_current_second: int         = 0    # last second boundary that was aggregated
+_curr_books:          dict[str, dict] = {}
+_asset_id_market_map: dict[str, str]  = {}   # {asset_id: 'UP' | 'DOWN'}
+_feature_buffers:     dict[str, list] = {}   # {'UP': [...], 'DOWN': [...]}
+_tick_buffers:        dict[str, list] = {}   # sub-second ticks per market
+_current_second:      int             = 0    # last second boundary that was aggregated
 
 _interval_end: int   = 0          # Unix-second timestamp of current interval end
 
@@ -124,12 +127,8 @@ def _get_interval_end() -> int:
     return (int(time.time()) // 300) * 300 + 300
 
 
-def _compute_base_features() -> dict | None:
-    """Derive per-snapshot feature row for the XGB model from the current live order book."""
-    book = next(iter(_curr_books.values()), None)
-    if not book:
-        return None
-
+def _compute_base_features(book: dict) -> dict | None:
+    """Derive per-snapshot feature row for the XGB model from a live order book."""
     bids = sorted(book['bids'], key=lambda x: -x['price'])
     asks = sorted(book['asks'], key=lambda x:  x['price'])
     if not bids or not asks:
@@ -227,36 +226,47 @@ def _build_xgb_features(buf_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _try_predict() -> dict | None:
-    """Build XGB feature vector and return quantile predictions, or None."""
-    if _xgb_models is None or not _xgb_feat_cols:
-        return None
-    if len(_feature_buffer) < _XGB_MIN_BUFFER:
+    """Build combined XGB feature vector from both market buffers and return per-market predictions."""
+    if _xgb_models is None or not _xgb_feat_cols or not _xgb_markets:
         return None
 
-    buf_df   = pd.DataFrame(_feature_buffer[-_XGB_MIN_BUFFER:]).reset_index(drop=True)
-    feat_df  = _build_xgb_features(buf_df)
-    last_row = feat_df.iloc[[-1]].copy()
+    # All markets must have enough history
+    for mkt in _xgb_markets:
+        if len(_feature_buffers.get(mkt, [])) < _XGB_MIN_BUFFER:
+            return None
+
+    # Build last row per market (with OFI/lags/rolling), then suffix and join
+    market_last_rows: dict[str, pd.DataFrame] = {}
+    mid_logits:       dict[str, float]        = {}
+    for mkt in _xgb_markets:
+        buf_df  = pd.DataFrame(_feature_buffers[mkt][-_XGB_MIN_BUFFER:]).reset_index(drop=True)
+        feat_df = _build_xgb_features(buf_df)
+        row     = feat_df.iloc[[-1]].copy().add_suffix(f'_{mkt.lower()}')
+        market_last_rows[mkt] = row
+        mid_logits[mkt] = float(feat_df.iloc[-1]['mid'])
+
+    combined = pd.concat(list(market_last_rows.values()), axis=1)
 
     for c in _xgb_feat_cols:
-        if c not in last_row.columns:
-            last_row[c] = float('nan')
+        if c not in combined.columns:
+            combined[c] = float('nan')
 
-    X = last_row[_xgb_feat_cols].values.astype(float)
+    X = combined[_xgb_feat_cols].values.astype(float)
     if np.any(np.isnan(X)):
         nan_cols = [_xgb_feat_cols[i] for i in range(len(_xgb_feat_cols)) if np.isnan(X[0, i])]
         logger.debug(f"Skipping prediction — NaN in: {nan_cols[:5]}")
         return None
 
-    # Current mid in price space (inverse of notebook logit: x = 1 - exp(-logit))
-    mid_logit = float(last_row['mid'].values[0])
-    mid_raw   = 1.0 - float(np.exp(-mid_logit))
-
-    result: dict = {'mid': mid_raw}
-    for q, pipe in _xgb_models.items():
-        return_pred = float(pipe.predict(X)[0])
-        pred_logit  = mid_logit + return_pred
-        pred_price  = float(np.clip(1.0 - np.exp(-pred_logit), 0.0, 1.0))
-        result[f'q{int(q * 100)}'] = pred_price  # e.g. 'q10', 'q50', 'q90'
+    result: dict = {}
+    for mkt in _xgb_markets:
+        mid_logit = mid_logits[mkt]
+        mid_raw   = 1.0 - float(np.exp(-mid_logit))
+        mkt_preds: dict = {'mid': mid_raw}
+        for q, pipe in _xgb_models[mkt].items():
+            return_pred = float(pipe.predict(X)[0])
+            pred_logit  = mid_logit + return_pred
+            mkt_preds[f'q{int(q * 100)}'] = float(np.clip(1.0 - np.exp(-pred_logit), 0.0, 1.0))
+        result[mkt] = mkt_preds
 
     return result
 
@@ -315,10 +325,17 @@ def _apply_book_update(asset_id: str, msg: dict) -> None:
 
 
 async def run_polymarket_stream(token_ids: list[str]) -> None:
-    global _curr_books, _feature_buffer, _tick_buffer, _current_second, _interval_end
+    global _curr_books, _asset_id_market_map, _feature_buffers, _tick_buffers, _current_second, _interval_end
+
+    markets = _xgb_markets if _xgb_markets else ['UP', 'DOWN']
+    _asset_id_market_map = {tid: markets[i] for i, tid in enumerate(token_ids[:len(markets)])}
+
     _curr_books.clear()
-    _feature_buffer.clear()
-    _tick_buffer.clear()
+    _feature_buffers.clear()
+    _tick_buffers.clear()
+    for mkt in markets:
+        _feature_buffers[mkt] = []
+        _tick_buffers[mkt]    = []
 
     logger.info(f"Starting Polymarket stream for {len(token_ids)} tokens")
     while True:
@@ -349,30 +366,35 @@ async def run_polymarket_stream(token_ids: list[str]) -> None:
                     if not _curr_books:
                         continue
 
-                    # Accumulate every sub-second tick
-                    tick = _compute_base_features()
-                    if tick is None:
-                        continue
-                    _tick_buffer.append(tick)
+                    # Accumulate a sub-second tick for each market whose book is ready
+                    for asset_id, mkt in _asset_id_market_map.items():
+                        if asset_id not in _curr_books:
+                            continue
+                        tick = _compute_base_features(_curr_books[asset_id])
+                        if tick is not None:
+                            _tick_buffers[mkt].append(tick)
 
-                    # At each new second boundary: aggregate ticks → 1s row
+                    # At each new second boundary: aggregate ticks → 1s row per market
                     this_second = int(now)
                     if this_second <= _current_second:
                         continue
                     _current_second = this_second
 
-                    # Reset buffer on interval rollover
+                    # Reset buffers on interval rollover
                     interval_end = _get_interval_end()
                     if interval_end != _interval_end:
                         _interval_end = interval_end
-                        _feature_buffer.clear()
+                        for mkt in _feature_buffers:
+                            _feature_buffers[mkt].clear()
 
-                    row_1s = _aggregate_1s_row(_tick_buffer)
-                    _tick_buffer.clear()
-
-                    _feature_buffer.append(row_1s)
-                    if len(_feature_buffer) > _XGB_MIN_BUFFER * 4:
-                        _feature_buffer = _feature_buffer[-_XGB_MIN_BUFFER * 4:]
+                    for mkt, ticks in _tick_buffers.items():
+                        if not ticks:
+                            continue
+                        row_1s = _aggregate_1s_row(ticks)
+                        ticks.clear()
+                        _feature_buffers[mkt].append(row_1s)
+                        if len(_feature_buffers[mkt]) > _XGB_MIN_BUFFER * 4:
+                            _feature_buffers[mkt] = _feature_buffers[mkt][-_XGB_MIN_BUFFER * 4:]
 
                     preds = await asyncio.to_thread(_try_predict)
                     if preds:
@@ -476,9 +498,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         stream_task.cancel()
                         await asyncio.sleep(0.1)
                     current_token_ids = token_ids
-                    stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
+                    stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
                 elif not stream_task or stream_task.done():
-                    stream_task = asyncio.create_task(run_polymarket_stream([token_ids[0]]))
+                    stream_task = asyncio.create_task(run_polymarket_stream(token_ids))
 
                 await websocket.send_text(json.dumps({
                     "event_type": "subscribed",
