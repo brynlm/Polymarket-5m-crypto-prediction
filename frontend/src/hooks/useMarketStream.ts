@@ -2,9 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import type { MarketState, OrderBook, PricePoint, PredictionPoint, OrderBookEntry } from '../types'
 
 const WS_URL            = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
-const MAX_PRICE_HISTORY = 300
-const MAX_PRED_HISTORY  = 300
-const FLUSH_INTERVAL_MS = 1000   // flush refs → React state at 1 Hz
+const MAX_PRED_HISTORY    = 300
+const FLUSH_INTERVAL_MS   = 200     // flush refs → React state at 5 Hz
+const PRICE_MIN_INTERVAL  = 200     // record at most one price point per 200 ms
+const PRICE_HISTORY_MS    = 360_000 // keep up to 6 minutes of price history
 
 function getMidPrice(books: Record<string, OrderBook>, upTokenId: string | null): PricePoint | null {
   const book = (upTokenId && books[upTokenId]) || Object.values(books)[0]
@@ -34,7 +35,8 @@ export function useMarketStream(slug: string | null) {
   // All mutable data lives in refs — onmessage writes here, interval flushes to React state
   const upTokenIdRef   = useRef<string | null>(null)
   const booksRef       = useRef<Record<string, OrderBook>>({})
-  const priceHistRef   = useRef<PricePoint[]>([])
+  const priceHistRef      = useRef<PricePoint[]>([])
+  const lastPriceTimeRef  = useRef<number>(0)
   const predHistRef    = useRef<PredictionPoint[]>([])
   const latestPredsRef = useRef<Record<string, Record<string, number>> | null>(null)
   const statusRef      = useRef<MarketState['status']>('disconnected')
@@ -74,7 +76,8 @@ export function useMarketStream(slug: string | null) {
     // Reset all refs and immediately show connecting state
     upTokenIdRef.current   = null
     booksRef.current       = {}
-    priceHistRef.current   = []
+    priceHistRef.current      = []
+    lastPriceTimeRef.current  = 0
     predHistRef.current    = []
     latestPredsRef.current = null
     statusRef.current      = 'connecting'
@@ -158,8 +161,10 @@ export function useMarketStream(slug: string | null) {
 
         if (priceUpdated) {
           const point = getMidPrice(booksRef.current, upTokenIdRef.current)
-          if (point) {
-            priceHistRef.current = [...priceHistRef.current, point].slice(-MAX_PRICE_HISTORY)
+          if (point && point.time - lastPriceTimeRef.current >= PRICE_MIN_INTERVAL) {
+            lastPriceTimeRef.current = point.time
+            const cutoff = point.time - PRICE_HISTORY_MS
+            priceHistRef.current = [...priceHistRef.current.filter(p => p.time >= cutoff), point]
           }
         }
       }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   LineChart,
   Line,
@@ -50,7 +50,7 @@ const SERIES = [
 type SeriesKey = typeof SERIES[number]['key']
 
 type ChartPoint = {
-  time: string
+  ts:         number
   Mid:        number | null
   Bid:        number | null
   Ask:        number | null
@@ -77,6 +77,18 @@ function formatWindowLabel(secs: number) {
 export function PriceChart({ data, predictionHistory, latestPredictions }: Props) {
   const [visible, setVisible] = useState<Record<SeriesKey, boolean>>(DEFAULT_VISIBLE)
   const [windowSecs, setWindowSecs] = useState(DEFAULT_WINDOW_SECS)
+  const [now, setNow] = useState(() => Date.now())
+  const rafRef = useRef<number>(0)
+  const windowFilledRef = useRef(false)
+
+  useEffect(() => {
+    const tick = () => {
+      setNow(Date.now())
+      rafRef.current = requestAnimationFrame(tick)
+    }
+    rafRef.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [])
 
   const toggleSeries = (key: SeriesKey) =>
     setVisible(v => ({ ...v, [key]: !v[key] }))
@@ -89,16 +101,33 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
     )
   }
 
-  const lastPoint  = data[data.length - 1]
-  const cutoff     = lastPoint.time - windowSecs * 1000
-  const windowData = data.filter(p => p.time >= cutoff)
+  const windowMs = windowSecs * 1000
+  const cutoff   = now - windowMs
+
+  // Lock to fixed-width domain once a full window of data has arrived.
+  // Only reset on a genuine new-interval clear (data[0] jumps >10s ahead of cutoff),
+  // not on the tiny per-point fluctuations of the rolling buffer hovering near cutoff.
+  if (windowFilledRef.current && data[0].time > cutoff + 10_000) windowFilledRef.current = false
+  if (!windowFilledRef.current && data[0].time <= cutoff) windowFilledRef.current = true
+  const xLeft    = windowFilledRef.current ? cutoff : data[0].time
+
+  const firstIdx   = data.findIndex(p => p.time >= xLeft)
+  const windowData = data.slice(Math.max(0, firstIdx - 1))
+
+  // Ticks anchored to absolute rounded time boundaries so they slide leftward with the
+  // data rather than recalculating positions every frame and appearing to stutter.
+  const TICK_COUNT    = 5
+  const tickInterval  = Math.round((now - xLeft) / TICK_COUNT / 1000) * 1000 || 1000
+  const lastTickBase  = Math.floor(now / tickInterval) * tickInterval
+  const xTicks        = Array.from({ length: TICK_COUNT + 2 }, (_, i) => lastTickBase - i * tickInterval)
+    .filter(t => t >= xLeft && t <= now)
   const hasPreds   = latestPredictions?.['UP']?.['q50'] != null
 
   // Map each price point to its nearest prediction from history (UP market for the chart)
   const formatted: ChartPoint[] = windowData.map(p => {
     const preds = findNearestPreds(predictionHistory, p.time)?.['UP']
     return {
-      time:       formatTime(p.time),
+      ts:         p.time,
       Mid:        +p.midPrice.toFixed(4),
       Bid:        +p.bestBid.toFixed(4),
       Ask:        +p.bestAsk.toFixed(4),
@@ -107,6 +136,13 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
       Q90:        preds?.['q90'] != null ? +preds['q90'].toFixed(4) : null,
     }
   })
+
+  // Phantom "live" point pinned to now — holds last known values so each series
+  // traces smoothly to the right edge rather than jumping when a new point arrives.
+  const last = formatted[formatted.length - 1]
+  if (last && last.ts < now) {
+    formatted.push({ ...last, ts: now })
+  }
 
   // Domain: include Q values in range
   const allPrices = windowData.flatMap(p => [p.bestBid, p.bestAsk])
@@ -159,12 +195,20 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
       <ResponsiveContainer width="100%" height={260}>
         <LineChart data={formatted}>
           <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-          <XAxis dataKey="time" tick={{ fill: '#6b7280', fontSize: 10 }} interval="preserveStartEnd" />
+          <XAxis
+            dataKey="ts"
+            type="number"
+            domain={[xLeft, now]}
+            ticks={xTicks}
+            tickFormatter={formatTime}
+            tick={{ fill: '#6b7280', fontSize: 10 }}
+          />
           <YAxis domain={domain} tick={{ fill: '#6b7280', fontSize: 10 }} width={55} />
           <Tooltip
             contentStyle={{ backgroundColor: '#111827', border: '1px solid #374151', borderRadius: 6 }}
             labelStyle={{ color: '#9ca3af', marginBottom: 4 }}
             itemStyle={{ fontSize: 12 }}
+            labelFormatter={(v: number) => formatTime(v)}
           />
           {SERIES.map(({ key, color, width, dash }) =>
             visible[key] ? (
@@ -175,8 +219,13 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
                 stroke={color}
                 strokeWidth={width}
                 strokeDasharray={dash}
-                dot={false}
+                dot={(props: any) => {
+                  if (props.index !== formatted.length - 1 || props.cy == null) return <g key={props.key} />
+                  return <circle key={props.key} cx={props.cx} cy={props.cy} r={3.5} fill={color} stroke="#111827" strokeWidth={1.5} />
+                }}
+                activeDot={false}
                 connectNulls={false}
+                isAnimationActive={false}
               />
             ) : null
           )}
