@@ -3,17 +3,15 @@ import { useMarketStream } from './hooks/useMarketStream'
 import { PriceChart } from './components/PriceChart'
 import { OrderBook } from './components/OrderBook'
 
-const API_URL       = import.meta.env.VITE_API_URL || 'http://localhost:8000'
-const INTERVAL_MS   = 5 * 60 * 1000   // 5-minute market interval
+const INTERVAL_SECS = 5 * 60
+const INTERVAL_MS   = INTERVAL_SECS * 1000
+
+function currentSlug() {
+  return `btc-updown-5m-${Math.floor(Date.now() / 1000 / INTERVAL_SECS) * INTERVAL_SECS}`
+}
 
 function msUntilNextInterval() {
   return INTERVAL_MS - (Date.now() % INTERVAL_MS)
-}
-
-interface ActiveMarket {
-  slug: string
-  label: string
-  question?: string
 }
 
 const STATUS_DOT: Record<string, string> = {
@@ -24,59 +22,24 @@ const STATUS_DOT: Record<string, string> = {
 }
 
 export default function App() {
-  const [activeMarkets, setActiveMarkets] = useState<ActiveMarket[]>([])
-  const [selectedSlug, setSelectedSlug] = useState<string | null>(null)
-  const [customSlug, setCustomSlug] = useState('')
-  const [wakingUp, setWakingUp] = useState(false)
-
-  const market = useMarketStream(selectedSlug)
-
-  function fetchMarkets(forceSwitch: boolean, attempt = 0) {
-    fetch(`${API_URL}/api/markets/active`)
-      .then(r => r.json())
-      .then((data: ActiveMarket[]) => {
-        setWakingUp(false)
-        setActiveMarkets(data)
-        if (data.length > 0) {
-          if (forceSwitch) setSelectedSlug(data[0].slug)
-          else setSelectedSlug(s => s ?? data[0].slug)
-        }
-      })
-      .catch(() => {
-        if (attempt < 24) {  // retry for up to ~2 minutes
-          setWakingUp(true)
-          setTimeout(() => fetchMarkets(forceSwitch, attempt + 1), 5000)
-        } else {
-          setWakingUp(false)
-        }
-      })
-  }
-
-  // Initial load
-  useEffect(() => { fetchMarkets(false) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [slug, setSlug] = useState(currentSlug)
 
   // Auto-switch at each 5-minute interval boundary
   useEffect(() => {
     let timerId: ReturnType<typeof setTimeout>
     function scheduleNext() {
       timerId = setTimeout(() => {
-        fetchMarkets(true)
+        setSlug(currentSlug())
         scheduleNext()
       }, msUntilNextInterval())
     }
     scheduleNext()
     return () => clearTimeout(timerId)
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
-  function handleCustomSlug() {
-    const slug = customSlug.trim()
-    if (slug) {
-      setSelectedSlug(slug)
-      setCustomSlug('')
-    }
-  }
+  const market = useMarketStream(slug)
 
-  const bestBook = Object.values(market.orderBooks)[0]
+  const bestBook = (market.upTokenId && market.orderBooks[market.upTokenId]) || Object.values(market.orderBooks)[0]
   const bestBid = bestBook?.bids[0]?.price
   const bestAsk = bestBook?.asks[0]?.price
   const midPrice = bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : null
@@ -87,46 +50,11 @@ export default function App() {
       <div className="flex items-start justify-between mb-5">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-white">Polymarket Dashboard</h1>
-          <p className="text-xs text-gray-500 mt-0.5">
-            {wakingUp ? 'Waking up server...' : (selectedSlug ?? 'No market selected')}
-          </p>
+          <p className="text-xs text-gray-500 mt-0.5">{slug}</p>
         </div>
         <div className="flex items-center gap-2 mt-1">
           <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
           <span className="text-xs text-gray-400 capitalize">{market.status}</span>
-        </div>
-      </div>
-
-      {/* Market selector */}
-      <div className="flex flex-wrap gap-2 mb-5">
-        {activeMarkets.map(m => (
-          <button
-            key={m.slug}
-            onClick={() => setSelectedSlug(m.slug)}
-            className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-              selectedSlug === m.slug
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
-            }`}
-          >
-            {m.label}
-          </button>
-        ))}
-        <div className="flex gap-1.5">
-          <input
-            type="text"
-            placeholder="Custom slug..."
-            value={customSlug}
-            onChange={e => setCustomSlug(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleCustomSlug()}
-            className="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 placeholder-gray-600 focus:outline-none focus:border-blue-500 w-48"
-          />
-          <button
-            onClick={handleCustomSlug}
-            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs transition-colors"
-          >
-            Go
-          </button>
         </div>
       </div>
 
@@ -164,7 +92,7 @@ export default function App() {
 
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
           <h2 className="text-sm font-medium text-gray-300 mb-3">Order Book</h2>
-          <OrderBook books={market.orderBooks} />
+          <OrderBook books={market.orderBooks} yesTokenId={market.upTokenId} />
         </div>
 
       </div>

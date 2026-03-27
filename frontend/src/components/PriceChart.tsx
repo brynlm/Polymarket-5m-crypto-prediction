@@ -13,7 +13,7 @@ import type { PricePoint, PredictionPoint } from '../types'
 interface Props {
   data: PricePoint[]
   predictionHistory: PredictionPoint[]
-  latestPredictions: Record<string, number> | null
+  latestPredictions: Record<string, Record<string, number>> | null
 }
 
 /** Binary-search predictionHistory for the entry nearest to `time`, within maxDeltaMs. */
@@ -21,7 +21,7 @@ function findNearestPreds(
   preds: PredictionPoint[],
   time: number,
   maxDeltaMs = 5000,
-): Record<string, number> | null {
+): Record<string, Record<string, number>> | null {
   if (preds.length === 0) return null
   let lo = 0, hi = preds.length - 1
   while (lo < hi) {
@@ -92,11 +92,11 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
   const lastPoint  = data[data.length - 1]
   const cutoff     = lastPoint.time - windowSecs * 1000
   const windowData = data.filter(p => p.time >= cutoff)
-  const hasPreds   = latestPredictions != null && latestPredictions['q50'] != null
+  const hasPreds   = latestPredictions?.['UP']?.['q50'] != null
 
-  // Map each price point to its nearest prediction from history
+  // Map each price point to its nearest prediction from history (UP market for the chart)
   const formatted: ChartPoint[] = windowData.map(p => {
-    const preds = findNearestPreds(predictionHistory, p.time)
+    const preds = findNearestPreds(predictionHistory, p.time)?.['UP']
     return {
       time:       formatTime(p.time),
       Mid:        +p.midPrice.toFixed(4),
@@ -184,16 +184,30 @@ export function PriceChart({ data, predictionHistory, latestPredictions }: Props
       </ResponsiveContainer>
 
       {hasPreds && (
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          {(['q10', 'q50', 'q90'] as const).map((key, i) => {
-            const labels = ['10th %ile', 'Median', '90th %ile']
-            const colors = ['text-violet-400', 'text-amber-400', 'text-orange-400']
-            const val = latestPredictions![key]
+        <div className="mt-3 space-y-2">
+          {(['UP', 'DOWN'] as const).map(mkt => {
+            const mktPreds = latestPredictions![mkt]
+            if (!mktPreds) return null
+            const mktColors: Record<string, string> = {
+              UP: 'text-emerald-400', DOWN: 'text-rose-400',
+            }
             return (
-              <div key={key} className="bg-gray-800 rounded px-2 py-1.5 text-center">
-                <div className="text-xs text-gray-500 mb-0.5">{labels[i]} +5s</div>
-                <div className={`text-sm font-mono ${colors[i]}`}>
-                  {val != null ? val.toFixed(4) : '—'}
+              <div key={mkt}>
+                <div className={`text-xs font-semibold mb-1 ${mktColors[mkt]}`}>{mkt}</div>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['q10', 'q50', 'q90'] as const).map((key, i) => {
+                    const labels = ['10th %ile', 'Median', '90th %ile']
+                    const colors = ['text-violet-400', 'text-amber-400', 'text-orange-400']
+                    const val = mktPreds[key]
+                    return (
+                      <div key={key} className="bg-gray-800 rounded px-2 py-1.5 text-center">
+                        <div className="text-xs text-gray-500 mb-0.5">{labels[i]} +5s</div>
+                        <div className={`text-sm font-mono ${colors[i]}`}>
+                          {val != null ? val.toFixed(4) : '—'}
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )

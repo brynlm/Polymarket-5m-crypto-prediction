@@ -19,14 +19,15 @@ export interface PricePoint {
 
 export interface PredictionPoint {
   time: number
-  predictions: Record<string, number>
+  predictions: Record<string, Record<string, number>>  // { UP: { q10, q50, q90, mid }, DOWN: { ... } }
 }
 
 export interface MarketState {
   orderBooks: Record<string, OrderBook>
+  upTokenId: string | null
   priceHistory: PricePoint[]
   predictionHistory: PredictionPoint[]
-  latestPredictions: Record<string, number> | null
+  latestPredictions: Record<string, Record<string, number>> | null
   status: 'disconnected' | 'connecting' | 'connected' | 'error'
   error?: string
 }

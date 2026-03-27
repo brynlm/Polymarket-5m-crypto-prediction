@@ -6,8 +6,8 @@ const MAX_PRICE_HISTORY = 300
 const MAX_PRED_HISTORY  = 300
 const FLUSH_INTERVAL_MS = 1000   // flush refs → React state at 1 Hz
 
-function getMidPrice(books: Record<string, OrderBook>): PricePoint | null {
-  const book = Object.values(books)[0]
+function getMidPrice(books: Record<string, OrderBook>, upTokenId: string | null): PricePoint | null {
+  const book = (upTokenId && books[upTokenId]) || Object.values(books)[0]
   if (!book || !book.bids.length || !book.asks.length) return null
   const bestBid = book.bids[0].price
   const bestAsk = book.asks[0].price
@@ -21,7 +21,7 @@ function parseEntries(raw: { price: string; size: string }[], descending: boolea
 }
 
 const INITIAL_STATE: MarketState = {
-  orderBooks: {}, priceHistory: [], predictionHistory: [],
+  orderBooks: {}, upTokenId: null, priceHistory: [], predictionHistory: [],
   latestPredictions: null, status: 'disconnected',
 }
 
@@ -32,10 +32,11 @@ export function useMarketStream(slug: string | null) {
   const reconnectRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // All mutable data lives in refs — onmessage writes here, interval flushes to React state
+  const upTokenIdRef   = useRef<string | null>(null)
   const booksRef       = useRef<Record<string, OrderBook>>({})
   const priceHistRef   = useRef<PricePoint[]>([])
   const predHistRef    = useRef<PredictionPoint[]>([])
-  const latestPredsRef = useRef<Record<string, number> | null>(null)
+  const latestPredsRef = useRef<Record<string, Record<string, number>> | null>(null)
   const statusRef      = useRef<MarketState['status']>('disconnected')
 
   // 1-second flush: copy refs into React state (the only setState call in the hot path)
@@ -43,6 +44,7 @@ export function useMarketStream(slug: string | null) {
     const timer = setInterval(() => {
       setState({
         orderBooks:        booksRef.current,
+        upTokenId:         upTokenIdRef.current,
         priceHistory:      priceHistRef.current,
         predictionHistory: predHistRef.current,
         latestPredictions: latestPredsRef.current,
@@ -70,12 +72,13 @@ export function useMarketStream(slug: string | null) {
     }
 
     // Reset all refs and immediately show connecting state
+    upTokenIdRef.current   = null
     booksRef.current       = {}
     priceHistRef.current   = []
     predHistRef.current    = []
     latestPredsRef.current = null
     statusRef.current      = 'connecting'
-    setState({ ...INITIAL_STATE, status: 'connecting' })
+    setState({ ...INITIAL_STATE, upTokenId: null, status: 'connecting' })
 
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
@@ -94,10 +97,16 @@ export function useMarketStream(slug: string | null) {
         const eventType = (msg.event_type as string) ?? 'unknown'
         const assetId   = msg.asset_id as string | undefined
 
+        if (eventType === 'subscribed') {
+          const ids = msg.token_ids as string[] | undefined
+          if (ids?.[0]) upTokenIdRef.current = ids[0]
+          continue
+        }
+
         if (eventType === 'prediction') {
           const predPoint: PredictionPoint = {
             time:        msg.timestamp as number,
-            predictions: msg.predictions as Record<string, number>,
+            predictions: msg.predictions as Record<string, Record<string, number>>,
           }
           predHistRef.current    = [...predHistRef.current, predPoint].slice(-MAX_PRED_HISTORY)
           latestPredsRef.current = predPoint.predictions
@@ -148,7 +157,7 @@ export function useMarketStream(slug: string | null) {
         }
 
         if (priceUpdated) {
-          const point = getMidPrice(booksRef.current)
+          const point = getMidPrice(booksRef.current, upTokenIdRef.current)
           if (point) {
             priceHistRef.current = [...priceHistRef.current, point].slice(-MAX_PRICE_HISTORY)
           }
