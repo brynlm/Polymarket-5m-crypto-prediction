@@ -433,6 +433,11 @@ def get_token_ids(slug: str) -> tuple[list[str], dict]:
         return [], {}
 
 
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
+
 @app.get("/api/market/{slug}")
 def get_market(slug: str):
     token_ids, market = get_token_ids(slug)
