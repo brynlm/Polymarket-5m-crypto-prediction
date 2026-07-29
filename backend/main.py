@@ -92,13 +92,13 @@ def _load_model() -> None:
     _xgb_feat_cols  = meta['feat_cols']
     _xgb_quantiles  = meta['quantiles']
     _n_levels       = meta.get('n_levels',      _n_levels)
-    _max_min_cols   = meta.get('max_min_cols',   _max_min_cols)
-    _ave_cols       = meta.get('ave_cols',       _ave_cols)
-    _lagged_cols    = meta.get('lagged_cols',    _lagged_cols)
-    _lags           = meta.get('lags',           _lags)
-    _roll_ave_cols  = meta.get('roll_ave_cols',  _roll_ave_cols)
-    _roll_windows   = meta.get('roll_windows',   _roll_windows)
-    _pred_window    = meta.get('pred_window',    _pred_window)
+    _max_min_cols   = meta.get('max_min_cols',  _max_min_cols)
+    _ave_cols       = meta.get('ave_cols',      _ave_cols)
+    _lagged_cols    = meta.get('lagged_cols',   _lagged_cols)
+    _lags           = meta.get('lags',          _lags)
+    _roll_ave_cols  = meta.get('roll_ave_cols', _roll_ave_cols)
+    _roll_windows   = meta.get('roll_windows',  _roll_windows)
+    _pred_window    = meta.get('pred_window',   _pred_window)
     min_for_lags  = (max(_lags) + 2) if _lags else 7
     min_for_rolls = max(_roll_windows) if _roll_windows else 1
     _XGB_MIN_BUFFER = max(min_for_lags, min_for_rolls)
@@ -189,21 +189,21 @@ def _compute_base_features(book: dict) -> dict | None:
 
 
 def _aggregate_1s_row(ticks: list[dict]) -> dict:
-    """Aggregate sub-second tick dicts into a 1-second bar, matching downsample_features_1s:
-    - base columns: last tick value (.last())
-    - max_min_cols: per-second max → {col}_max, min → {col}_min
-    - ave_cols:     per-second mean → {col}_ave
+    """Aggregate sub-second tick dicts into a 1-second bar.
+
+    max_min_cols/ave_cols are self-aliased from the last tick's value, NOT a
+    genuine max/min/mean over ticks — matching retrain.py's add_1s_aliases.
+    Training data (market_features) is one snapshot per second, so there's no
+    reliable intra-second ground truth to serve consistently with; computing a
+    real max/min/mean here would feed the model live variance it was never
+    trained to expect. Must match retrain.py exactly.
     """
     row = dict(ticks[-1])  # last tick as base (matches groupby.last())
     for col in _max_min_cols:
-        vals = [t[col] for t in ticks if col in t]
-        if vals:
-            row[f'{col}_max'] = max(vals)
-            row[f'{col}_min'] = min(vals)
+        row[f'{col}_max'] = row[col]
+        row[f'{col}_min'] = row[col]
     for col in _ave_cols:
-        vals = [t[col] for t in ticks if col in t]
-        if vals:
-            row[f'{col}_ave'] = sum(vals) / len(vals)
+        row[f'{col}_ave'] = row[col]
     return row
 
 

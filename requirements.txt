@@ -1,0 +1,7 @@
+asyncpg
+python-dotenv
+pandas
+numpy
+joblib
+scikit-learn==1.7.2
+xgboost==3.2.0

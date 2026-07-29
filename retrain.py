@@ -11,7 +11,7 @@ import os
 from xgboost import XGBRegressor
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -32,14 +32,25 @@ MARKETS       = ['UP', 'DOWN']
 
 
 async def load_from_db() -> dict[str, pd.DataFrame]:
-    """Load all market data from DB, return one DataFrame per market keyed by market label."""
+    """Load BTC market data from market_features, return one DataFrame per market keyed by market label."""
     pool = await asyncpg.create_pool(DATABASE_URL, ssl='require')
     async with pool.acquire() as conn:
-        records = await conn.fetch("SELECT * FROM orderbook_features ORDER BY timestamp")
+        records = await conn.fetch(
+            """
+            SELECT timestamp, market,
+                   best_bid, best_ask,
+                   bid_size_l1, bid_size_l2, bid_size_l3, bid_size_l4, bid_size_l5,
+                   ask_size_l1, ask_size_l2, ask_size_l3, ask_size_l4, ask_size_l5,
+                   bid_vol_all, ask_vol_all, bid_n_levels, ask_n_levels, vwap
+            FROM market_features
+            WHERE instrument = 'btc'
+            ORDER BY timestamp
+            """
+        )
     await pool.close()
 
     df = pd.DataFrame([dict(r) for r in records])
-    df['ts_s'] = df['timestamp'].apply(lambda x: int(x.timestamp()))
+    df['ts_s'] = df['timestamp'].astype(int)
     df = df.set_index('ts_s').drop(columns=['timestamp']).sort_index()
 
     return {mkt: df[df['market'] == mkt].drop(columns=['market']) for mkt in MARKETS}
@@ -66,7 +77,9 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     feat['microprice']      = (feat['best_ask'] * feat['bid_vol'] + feat['best_bid'] * feat['ask_vol']) / denom_top
     feat['micro_minus_mid'] = feat['microprice'] - feat['mid']
 
-    # Uppercase L to match main.py / ml_training_pipeline.py convention
+    # Postgres folds unquoted identifiers to lowercase, so market_features
+    # returns bid_size_l1../ask_size_l1.. — rename to uppercase L to match
+    # backend/main.py's live feature-row convention (row[f'bid_size_L{i+1}']).
     feat = feat.rename(columns={
         **{f'bid_size_l{i+1}': f'bid_size_L{i+1}' for i in range(N_LEVELS)},
         **{f'ask_size_l{i+1}': f'ask_size_L{i+1}' for i in range(N_LEVELS)},
@@ -75,7 +88,15 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_1s_aliases(feat: pd.DataFrame) -> pd.DataFrame:
-    """DB data is already 1s-granular: max/min/ave over the interval equal the value."""
+    """DB data is one snapshot per second: max/min/ave over the interval equal the
+    value itself. market_features does have intra_max_bid/intra_min_ask (real
+    intra-second extremes from a separate best_bid_ask push feed), but those are
+    deliberately not used here — that feed isn't practical to reproduce reliably
+    at serving time (backend/main.py only tracks book/price_change events), so
+    self-aliasing on both sides keeps train/serve consistent even though it
+    means these columns carry no real intra-second signal. Must match
+    backend/main.py's _aggregate_1s_row exactly.
+    """
     for col in MAX_MIN_COLS:
         feat[f'{col}_max'] = feat[col]
         feat[f'{col}_min'] = feat[col]
@@ -110,8 +131,8 @@ def transform_features(feat: pd.DataFrame) -> pd.DataFrame:
 def prepare_market(df: pd.DataFrame) -> pd.DataFrame:
     """Full feature pipeline for a single market's raw DB rows."""
     feat = derive_features(df)
-    feat = add_1s_aliases(feat)
     feat['mid'] = _logit(feat['mid'])
+    feat = add_1s_aliases(feat)
     feat = transform_features(feat)
     return feat
 
@@ -142,6 +163,22 @@ if __name__ == "__main__":
     target_cols = [f'return_{mkt.lower()}' for mkt in MARKETS]
     feat_cols   = [c for c in combined.columns if c not in target_cols]
     X = combined[feat_cols].values
+
+    # Regression guard: column *names* must stay identical to the previously
+    # committed contract even though this pipeline sources different data —
+    # catches e.g. forgetting to drop intra_max_bid/intra_min_ask before they
+    # leak into feat_cols as columns backend/main.py can never supply.
+    _prev_meta_path = f'{MODEL_NAME}_meta.json'
+    if os.path.exists(_prev_meta_path):
+        with open(_prev_meta_path) as f:
+            _prev_feat_cols = set(json.load(f)['feat_cols'])
+        if _prev_feat_cols != set(feat_cols):
+            missing = _prev_feat_cols - set(feat_cols)
+            extra   = set(feat_cols) - _prev_feat_cols
+            raise ValueError(
+                f"feat_cols mismatch vs previous {_prev_meta_path}: "
+                f"missing={sorted(missing)} extra={sorted(extra)}"
+            )
 
     # ── Train 2 × 3 quantile models (one set per market) ──────────────────────
     # All models share the same combined feature set X.
