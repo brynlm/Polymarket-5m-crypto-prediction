@@ -50,7 +50,14 @@ export default function App() {
       <div className="flex items-start justify-between mb-5">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-white">Polymarket Dashboard</h1>
-          <p className="text-xs text-gray-500 mt-0.5">{slug}</p>
+          <a
+            href={`https://polymarket.com/event/${slug}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-gray-500 hover:text-blue-400 mt-0.5 inline-block"
+          >
+            {slug} ↗
+          </a>
         </div>
         <div className="flex items-center gap-2 mt-1">
           <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
