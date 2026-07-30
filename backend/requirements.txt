@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+requests
+joblib
+numpy
+pandas
+scikit-learn==1.7.2
+xgboost==3.2.0
