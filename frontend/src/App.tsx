@@ -21,8 +21,11 @@ const STATUS_DOT: Record<string, string> = {
   error: 'bg-red-500',
 }
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
 export default function App() {
   const [slug, setSlug] = useState(currentSlug)
+  const [modelTrainedAt, setModelTrainedAt] = useState<string | null>(null)
 
   // Auto-switch at each 5-minute interval boundary
   useEffect(() => {
@@ -35,6 +38,13 @@ export default function App() {
     }
     scheduleNext()
     return () => clearTimeout(timerId)
+  }, [])
+
+  useEffect(() => {
+    fetch(`${API_URL}/api/model_info`)
+      .then(res => res.json())
+      .then(data => setModelTrainedAt(data.trained_at ?? null))
+      .catch(() => setModelTrainedAt(null))
   }, [])
 
   const market = useMarketStream(slug)
@@ -59,9 +69,16 @@ export default function App() {
             {slug} ↗
           </a>
         </div>
-        <div className="flex items-center gap-2 mt-1">
-          <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
-          <span className="text-xs text-gray-400 capitalize">{market.status}</span>
+        <div className="flex flex-col items-end gap-1 mt-1">
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${STATUS_DOT[market.status]}`} />
+            <span className="text-xs text-gray-400 capitalize">{market.status}</span>
+          </div>
+          {modelTrainedAt && (
+            <span className="text-xs text-gray-600">
+              Model retrained: {new Date(modelTrainedAt).toLocaleString()}
+            </span>
+          )}
         </div>
       </div>
 

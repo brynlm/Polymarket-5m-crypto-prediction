@@ -8,6 +8,7 @@ import numpy as np
 import joblib
 import json
 import os
+from datetime import datetime, timezone
 from xgboost import XGBRegressor
 from dotenv import load_dotenv
 
@@ -137,7 +138,13 @@ def prepare_market(df: pd.DataFrame) -> pd.DataFrame:
     return feat
 
 
-if __name__ == "__main__":
+def train_and_save() -> dict:
+    """Full pipeline: load, engineer features, train, save, return diagnostics.
+
+    Shared entry point for both manual runs (python3 retrain.py) and the
+    scheduled cron job (scheduled_retrain.py), so there's exactly one code
+    path to keep correct.
+    """
     # ── Load ──────────────────────────────────────────────────────────────────
     print("Loading data from DB...")
     raw_by_market = asyncio.run(load_from_db())
@@ -210,6 +217,7 @@ if __name__ == "__main__":
                   f'PBL_90={pb_losses[0.9]:.6f}  (n_train={len(tr_idx):,}  n_val={len(val_idx):,})')
 
     # ── Final fit + diagnostics per market ────────────────────────────────────
+    diagnostics: dict = {'n_combined_rows': len(combined), 'markets': {}}
     for mkt in MARKETS:
         y = combined[f'return_{mkt.lower()}'].values
         mid_col = f'mid_{mkt.lower()}'
@@ -228,13 +236,27 @@ if __name__ == "__main__":
             (actual.values[s:] >= pred_quantiles[0.1].values[s:]) &
             (actual.values[s:] <= pred_quantiles[0.9].values[s:])
         )
+        coverage_80      = float(np.mean(within_80))
+        coverage_90      = float(np.mean(actual.values[s:] <= pred_quantiles[0.9].values[s:]))
+        coverage_10      = float(np.mean(actual.values[s:] <= pred_quantiles[0.1].values[s:]))
+        directional_acc  = float(np.mean(np.sign(y) == np.sign(pred_returns[0.5])))
+
         print(f"\n{mkt} diagnostics:")
-        print(f"  80% interval coverage:    {np.mean(within_80):.4f}")
-        print(f"  90th quantile coverage:   {np.mean(actual.values[s:] <= pred_quantiles[0.9].values[s:]):.4f}")
-        print(f"  10th quantile coverage:   {np.mean(actual.values[s:] <= pred_quantiles[0.1].values[s:]):.4f}")
-        print(f"  Directional acc (median): {np.mean(np.sign(y) == np.sign(pred_returns[0.5])):.4f}")
+        print(f"  80% interval coverage:    {coverage_80:.4f}")
+        print(f"  90th quantile coverage:   {coverage_90:.4f}")
+        print(f"  10th quantile coverage:   {coverage_10:.4f}")
+        print(f"  Directional acc (median): {directional_acc:.4f}")
+
+        diagnostics['markets'][mkt] = {
+            'n_rows':          int(len(raw_by_market[mkt])),
+            'coverage_80':     coverage_80,
+            'coverage_90':     coverage_90,
+            'coverage_10':     coverage_10,
+            'directional_acc': directional_acc,
+        }
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    trained_at = datetime.now(timezone.utc).isoformat()
     joblib.dump(models, MODEL_NAME + '.joblib')
     meta = {
         'feat_cols':     feat_cols,
@@ -249,7 +271,15 @@ if __name__ == "__main__":
         'lags':          LAGS,
         'roll_ave_cols': ROLL_AVE_COLS,
         'roll_windows':  ROLL_WINDOWS,
+        'trained_at':    trained_at,
     }
     with open(f'{MODEL_NAME}_meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
     print(f"\nSaved → {MODEL_NAME}.joblib + {MODEL_NAME}_meta.json  ({len(feat_cols)} features)")
+
+    diagnostics['trained_at'] = trained_at
+    return diagnostics
+
+
+if __name__ == "__main__":
+    train_and_save()

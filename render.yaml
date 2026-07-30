@@ -7,3 +7,7 @@ services:
     envVars:
       - key: ALLOWED_ORIGINS=https://your-app.vercel.app
         sync: false  # Set this in Render dashboard to your Vercel URL, e.g. https://your-app.vercel.app
+
+# Scheduled retraining runs via .github/workflows/scheduled_retrain.yml instead
+# of a Render Cron Job — Render Cron Jobs require a paid instance type, while
+# GitHub Actions is free for this workload.

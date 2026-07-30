@@ -53,6 +53,7 @@ _xgb_models: Optional[dict] = None   # {'UP': {0.1: Pipeline, ...}, 'DOWN': {...
 _xgb_markets:     list[str]   = []
 _xgb_feat_cols:   list[str]   = []
 _xgb_quantiles:   list[float] = []
+_model_trained_at: Optional[str] = None
 
 # Feature-engineering config — populated from metadata at load time
 _n_levels:      int        = 5
@@ -71,7 +72,7 @@ _XGB_MIN_BUFFER: int = 7   # updated dynamically in _load_model()
 
 
 def _load_model() -> None:
-    global _xgb_models, _xgb_markets, _xgb_feat_cols, _xgb_quantiles
+    global _xgb_models, _xgb_markets, _xgb_feat_cols, _xgb_quantiles, _model_trained_at
     global _n_levels, _max_min_cols, _ave_cols, _lagged_cols, _lags
     global _roll_ave_cols, _roll_windows, _pred_window, _XGB_MIN_BUFFER
 
@@ -88,9 +89,10 @@ def _load_model() -> None:
     with open(meta_path) as f:
         meta = json.load(f)
 
-    _xgb_markets    = meta.get('markets',       ['UP', 'DOWN'])
-    _xgb_feat_cols  = meta['feat_cols']
-    _xgb_quantiles  = meta['quantiles']
+    _xgb_markets      = meta.get('markets',       ['UP', 'DOWN'])
+    _xgb_feat_cols    = meta['feat_cols']
+    _xgb_quantiles    = meta['quantiles']
+    _model_trained_at = meta.get('trained_at')
     _n_levels       = meta.get('n_levels',      _n_levels)
     _max_min_cols   = meta.get('max_min_cols',  _max_min_cols)
     _ave_cols       = meta.get('ave_cols',      _ave_cols)
@@ -448,6 +450,16 @@ def get_market(slug: str):
         "token_ids": token_ids,
         "question":  market.get("question"),
         "end_date":  market.get("endDate"),
+    }
+
+
+@app.get("/api/model_info")
+def get_model_info():
+    return {
+        "trained_at": _model_trained_at,
+        "n_features": len(_xgb_feat_cols),
+        "quantiles":  _xgb_quantiles,
+        "markets":    _xgb_markets,
     }
 
 
