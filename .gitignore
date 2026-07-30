@@ -1,0 +1,31 @@
+# Python
+*__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Data & model artifacts
+logs/
+*.csv
+*.zip
+raw_book_data/**.pkl
+*.pkl
+*.ipynb
+
+# Misc
+.DS_Store
+predictions.png
+predictions_rf.png
+
+# IDE
+.vscode/

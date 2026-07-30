@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: polymarket-5m-btc-prediction
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ALLOWED_ORIGINS=https://your-app.vercel.app
+        sync: false  # Set this in Render dashboard to your Vercel URL, e.g. https://your-app.vercel.app
+
+# Scheduled retraining runs via .github/workflows/scheduled_retrain.yml instead
+# of a Render Cron Job — Render Cron Jobs require a paid instance type, while
+# GitHub Actions is free for this workload.

@@ -1,0 +1,27 @@
+name: Scheduled model retrain
+
+"on":
+  schedule:
+    - cron: "17 6 * * *"  # daily, off-peak UTC time
+  workflow_dispatch: {}   # allows manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write  # needed so the job can commit/push the retrained model
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Retrain and deploy if safe
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scheduled_retrain.py
