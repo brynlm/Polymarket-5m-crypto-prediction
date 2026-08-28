@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, not the default shallow (depth-1) clone: scheduled_retrain.py
+          # amends its own previous commit in place (git commit --amend) to keep main's
+          # history flat instead of growing a commit per run. A shallow clone has no
+          # parent commit available locally, so amending it produces a disconnected
+          # root commit with no ancestry — exactly what happened before this fix.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
