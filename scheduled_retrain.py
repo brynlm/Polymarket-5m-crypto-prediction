@@ -1,6 +1,6 @@
 """Scheduled entry point: retrain the XGB model and deploy it only if it looks sane.
 
-Run daily by .github/workflows/scheduled_retrain.yml. Calls
+Run weekly by .github/workflows/scheduled_retrain.yml. Calls
 retrain.train_and_save() — the same code path a manual `python3 retrain.py`
 run uses — then gates on the returned diagnostics before touching git. On
 failure (bad diagnostics or any exception, including retrain.py's own
